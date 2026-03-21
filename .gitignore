@@ -1,0 +1,40 @@
+# Credenziali - NON caricare mai
+user-config.py
+user-password.py
+
+# Pywikibot
+apicache/
+throttle.ctrl
+pywikibot-*.lwp
+
+# Cache locali
+moves_cache.json
+
+# Log
+bot_log.txt
+bot_voci_recenti.log
+
+# Python
+__pycache__/
+*.pyc
+
+# Backup e file temporanei
+backup/
+files.zip
+
+# Versioni precedenti
+bot_voci_recenti_v25.py
+bot_voci_recenti_v30.old.py
+"bot_voci_recenti_v30.old (2).py"
+bot_voci_recenti_v822.py
+bot_voci_recenti_v830.py
+bot_voci_recenti_v831.py
+bot_voci_recenti_v832.py
+bot_voci_recenti_v833.py
+bot_voci_recenti_v834.py
+bot_voci_recenti_v835.py
+*.sorgente
+*.sorgente.txt
+
+bot_voci_recenti_v30.old (2).py
+bot_voci_recenti_v828.rev2sorgente

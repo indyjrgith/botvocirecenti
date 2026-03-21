@@ -1,0 +1,316 @@
+# Bot VociRecenti — Documentazione
+
+## Scopo
+
+Il bot mantiene una cache delle voci di Wikipedia italiana create di recente,
+accessibile tramite il template {{VociRecenti}}. La cache permette al modulo
+Lua di filtrare e visualizzare le voci per categoria, titolo, testo e data
+senza dover interrogare l'API di Wikipedia ad ogni visualizzazione della pagina.
+
+---
+
+## Componenti
+
+| File | Scopo |
+|---|---|
+| `bot_voci_recenti_v85.py` | Bot principale: raccoglie le voci e aggiorna la cache |
+| `PuliziaCache.py` | Script di pulizia: rimuove voci non più valide dalla cache |
+| `Modulo:VociRecenti` | Modulo Lua: legge la cache e risponde alle chiamate del template |
+| `Modulo:VociRecenti/Dati1..N` | File cache: dati delle voci in formato Lua |
+| `Utente:BotVociRecenti/CacheMoved` | Lista manuale di voci da aggiungere alla cache |
+| `Utente:BotVociRecenti/CacheParsed` | Flag: indica se la cache manuale è già stata processata |
+| `cleanup_state.json` | File locale: tiene traccia se la pulizia è già stata eseguita nella fascia oraria |
+
+---
+
+## Come funziona il bot (logica generale)
+
+Il bot viene eseguito periodicamente (es. ogni ora tramite pianificatore).
+Ad ogni esecuzione segue questi passi:
+
+### STEP 1 — Pulizia automatica (AutoClean)
+
+Il bot verifica se deve eseguire `PuliziaCache.py` in base alla variabile `AutoClean`:
+
+- `Once` *(default)*: la pulizia viene eseguita una sola volta nella fascia oraria
+  definita da `AutoCleanTimeBegin` e `AutoCleanTimeEnd`. Fuori fascia il flag viene
+  resettato, così alla prossima fascia la pulizia verrà rieseguita.
+- `Every`: la pulizia viene eseguita ad ogni run.
+- `None`: la pulizia non viene mai eseguita.
+
+### STEP 2 — Caricamento cache esistente
+
+Il bot legge tutti i file `Modulo:VociRecenti/Dati1`, `Dati2`, ... e carica
+le voci già presenti in cache. I duplicati vengono ignorati.
+
+### STEP 3 — Calcolo data limite
+
+Il bot calcola fino a che data accettare voci. Il limite è il massimo tra:
+
+- 30 giorni fa (`MAX_AGE_DAYS`)
+- la data della voce più vecchia già presente in cache
+
+Questo impedisce che la cache si espanda verso il passato ad ogni esecuzione.
+
+### STEP 4 — Cache manuale (CacheMoved)
+
+Se la pagina `Utente:BotVociRecenti/CacheParsed` non contiene `True`, il bot
+legge `Utente:BotVociRecenti/CacheMoved`, una lista di voci da aggiungere
+manualmente (utile per voci create tramite spostamento da sandbox o namespace
+utente, che RecentChanges non intercetta come "nuove").
+
+Dopo aver processato la lista, il bot scrive `True` in `CacheParsed` per
+evitare di riprocessarla ad ogni esecuzione. Per far rileggere la lista basta
+cancellare o modificare `CacheParsed`.
+
+Il formato di `CacheMoved` supporta sia titoli semplici che righe copiate
+direttamente dal dump di Speciale:PagineRecenti:
+```
+Grimpella thaumastocheir
+16:32, 28 feb 2026 Altra voce (cron | modifica) [3 657 byte]
+```
+
+### STEP 5 — Ricerca nuove voci da RecentChanges
+
+Il bot interroga l'API di Wikipedia cercando TUTTE le voci create in NS0
+con timestamp più recente della voce più recente già in cache. La ricerca si
+ferma non appena incontra voci più vecchie del riferimento (non c'è un limite
+sul numero di voci trovate, solo un limite di sicurezza sulle chiamate API).
+
+Vengono cercate anche le voci spostate nel NS0 da altri namespace (sandbox,
+namespace utente, ecc.) nello stesso intervallo temporale.
+
+### STEP 6 — Unione, ordinamento e troncamento
+
+Tutte le voci (nuove + cache esistente + cache manuale) vengono unite,
+ordinate per data di creazione (dalla più recente alla più vecchia) e troncate
+al valore massimo `MAX_PAGES` (default: 3000), rimuovendo sempre le più vecchie.
+
+### STEP 7 — Salvataggio
+
+Le voci vengono suddivise in file da max `MAX_CHARS_PER_FILE` caratteri
+(default: ~1,5 MB) e salvate in `Modulo:VociRecenti/Dati1`, `Dati2`, ecc.
+I file in eccesso rispetto al necessario vengono svuotati automaticamente.
+
+---
+
+## Script di pulizia (PuliziaCache.py)
+
+Eseguito automaticamente dal bot (o manualmente), rimuove dalla cache:
+
+1. **Duplicati** — mantiene la copia più recente
+2. **Voci fuori NS0** — voci finite per errore in namespace sbagliato
+3. **Voci cancellate o redirect** — verifica l'esistenza attuale su Wikipedia
+4. **Voci troppo vecchie** — create più di `MAX_AGE_DAYS` giorni fa
+
+La pulizia usa il timestamp già presente in cache per il controllo dell'età
+(nessuna chiamata API aggiuntiva), mentre fa chiamate API per verificare
+esistenza e namespace.
+
+---
+
+## Modulo Lua (Modulo:VociRecenti)
+
+Il modulo legge automaticamente tutti i file `Dati1`, `Dati2`, ... e li
+unisce in memoria. Usa `require()` invece di `mw.loadData()` per gestire
+file di grandi dimensioni. Espone la funzione `main` con i seguenti parametri:
+
+| Parametro | Descrizione |
+|---|---|
+| `num` | Numero di voci da mostrare (default: 10) |
+| `OrCat` | Filtra per categoria (OR tra più valori separati da virgola) |
+| `AndCat` | Filtra per categoria (AND: la voce deve avere tutte le categorie) |
+| `Title` | Filtra per parola nel titolo (pipe `|` per OR) |
+| `Text` | Filtra per parola nel testo (pipe `|` per OR) |
+| `TextRegExp` | Filtra per espressione regolare nel testo |
+| `CaseSensitive` | `on`/`off` per la ricerca regex (default: off) |
+| `DataFine` | Mostra solo voci create dopo questa data (formato gg/mm/aaaa) |
+| `And` | `on`/`off`: se off i filtri si combinano in OR anziché AND (default: on) |
+| `Disp` | Formato: `s`=numerato, `v`=numerato con data, `t`=puntato, `o`=puntato con data |
+
+---
+
+## Stato sviluppo
+
+### Versione corrente: bot v8.5 / PuliziaCache aggiornato al parser v8.3
+
+### Cronologia versioni
+
+| Versione | Modifica principale |
+|---|---|
+| v8.0 | Separazione pulizia in script esterno, sistema CacheParsed, controllo duplicati |
+| v8.1 | Filtro data creazione: scarta voci più vecchie del limite calcolato dinamicamente |
+| v8.2 | Fix parser Lua: conteggio bilanciato delle graffe invece di regex fragile |
+| v8.3 | Fix parser Lua: graffe dentro long string Lua non sbilanciano più il parser. Risolveva il problema per cui il bot leggeva ~2400 voci invece di ~2880 dalla cache |
+| v8.4 | Sistema AutoClean con fascia oraria configurabile e file di stato locale JSON |
+| v8.5 | Fix logica RecentChanges: raccoglie TUTTE le voci nuove fino al timestamp di riferimento, troncamento a MAX_PAGES solo alla fine dopo unione e ordinamento |
+
+### Problemi noti / possibili miglioramenti futuri
+
+- `get_moved_to_ns0` usa un limite fisso di 5000 voci nei log di spostamento.
+- Il parser Lua in Python è custom: funziona sui file generati dal bot ma
+  potrebbe avere problemi con file modificati manualmente in modo non standard.
+
+---
+
+## Parametri di configurazione principali
+```python
+MAX_PAGES = 3000              # Numero massimo di voci in cache
+MAX_CHARS_PER_FILE = 1500000  # Dimensione massima per file cache (~1,5 MB)
+MAX_AGE_DAYS = 30             # Età massima delle voci in giorni
+AutoClean = 'Once'            # 'Once' | 'Every' | 'None'
+AutoCleanTimeBegin = '03:00'  # Inizio fascia oraria pulizia
+AutoCleanTimeEnd   = '05:00'  # Fine fascia oraria pulizia
+MAX_ITERATIONS = 100          # Limite chiamate API RecentChanges (sicurezza)
+```
+
+# Modulo:VociRecenti — Documentazione Lua
+
+## Scopo
+
+Il modulo legge la cache generata dal bot e restituisce una lista
+di voci di Wikipedia recenti, filtrate secondo i parametri passati
+dal template chiamante.
+
+---
+
+## Struttura della cache
+
+La cache è distribuita su più pagine wiki:
+
+- `Modulo:VociRecenti/Dati1`, `Dati2`, ... `DatiN`
+
+Ogni file è un modulo Lua che restituisce una tabella con struttura:
+```lua
+return {
+  ultimo_aggiornamento = '03/03/2026 04:15',
+  versione = '8.5',
+  parte = 1,
+  totale_parti = 12,
+  num_voci = 250,
+  voci = {
+    {
+      titolo = [[Nome della voce]],
+      timestamp = '20260303041500',
+      categorie = {
+        [[Categoria uno]],
+        [[Categoria due]],
+      },
+      contenuto = [[testo wikitesto della voce...]],
+    },
+    ...
+  }
+}
+```
+
+Il campo `contenuto` usa long string Lua con livello di escape automatico
+(`[[...]]`, `[=[...]=]`, ecc.) per evitare problemi con caratteri speciali
+nel wikitesto.
+
+---
+
+## Funzioni del modulo
+
+### `p.main(frame)`
+
+Funzione principale richiamata dal template. Legge i parametri, carica
+tutti i file cache, filtra le voci e restituisce l'output formattato.
+
+**Parametri template:**
+
+| Parametro | Tipo | Default | Descrizione |
+|---|---|---|---|
+| `num` | numero | 10 | Quante voci mostrare |
+| `OrCat` | stringa | — | Categorie in OR (virgola come separatore) |
+| `AndCat` | stringa | — | Categorie in AND (virgola come separatore) |
+| `Title` | stringa | — | Parola nel titolo (pipe `|` per OR) |
+| `Text` | stringa | — | Parola nel testo (pipe `|` per OR) |
+| `TextRegExp` | stringa | — | Pattern regex nel testo |
+| `CaseSensitive` | on/off | off | Distingue maiuscole/minuscole nella regex |
+| `DataFine` | gg/mm/aaaa | — | Solo voci create dopo questa data |
+| `And` | on/off | on | Se off, i filtri si combinano in OR |
+| `Disp` | s/v/t/o | s | Formato output (vedi sotto) |
+
+**Valori di `Disp`:**
+
+| Valore | Formato |
+|---|---|
+| `s` | Elenco numerato senza data |
+| `v` | Elenco numerato con data |
+| `t` | Elenco puntato senza data |
+| `o` | Elenco puntato con data |
+
+### `p.formatOutput(voci, disp, ultimoAggiornamento, numFiles)`
+
+Formatta la lista di voci filtrate in wikitext. Aggiunge in fondo
+la riga "Ultimo aggiornamento" con il numero di file cache usati.
+
+### `p.debugVoce(frame)`
+
+Funzione di debug: dato un titolo di voce, mostra le sue categorie
+e verifica se corrisponde a un filtro OrCat specificato.
+
+Esempio di utilizzo:
+```
+{{#invoke:VociRecenti|debugVoce|titolo=Nome voce|OrCat=aviatori}}
+```
+
+---
+
+## Logica di caricamento (loadAllData)
+
+Il modulo carica i file cache in sequenza (`Dati1`, `Dati2`, ...) finché
+ne trova. Usa `require()` invece di `mw.loadData()` per gestire file
+di grandi dimensioni (mw.loadData ha limiti di dimensione più restrittivi).
+
+Se un file non esiste, la sequenza si interrompe. Se un file esiste ma
+è vuoto o malformato, viene ignorato silenziosamente.
+
+---
+
+## Logica di filtraggio
+
+I filtri vengono applicati in sequenza su ogni voce della cache.
+La modalità di combinazione dipende dal parametro `And`:
+
+**Modalità AND (default, `And=on`):**
+Tutti i filtri specificati devono essere soddisfatti simultaneamente.
+
+**Modalità OR (`And=off`):**
+Basta che almeno uno dei filtri sia soddisfatto. Il filtro `DataFine`
+viene sempre applicato in AND anche in modalità OR.
+
+**Ricerca nelle categorie:**
+- `OrCat`: cerca ogni termine nella lista delle categorie della voce.
+  La voce è inclusa se almeno una categoria contiene almeno uno dei termini.
+- `AndCat`: come OrCat ma tutti i termini devono essere trovati.
+
+**Ricerca nel testo:**
+- Case-insensitive per default.
+- Supporta il pipe `|` come operatore OR: `gotico|romanico|barocco`.
+- `TextRegExp` accetta pattern Lua (non PCRE).
+
+---
+
+## Stato sviluppo Lua
+
+### Versione corrente: v7.0
+
+### Cronologia versioni Lua
+
+| Versione | Modifica principale |
+|---|---|
+| v1-v5 | Sviluppo iniziale, singolo file cache, filtri base |
+| v6.0 | Supporto multi-file cache (Dati1, Dati2, ...) |
+| v7.0 | Caricamento automatico file multipli, parametro `And` per combinazione filtri OR/AND |
+
+### Note tecniche
+
+Il modulo usa `pcall` per proteggere il `require()` di ogni file cache:
+se un file ha errori di sintassi Lua, viene saltato senza bloccare
+l'intera esecuzione. Gli errori vengono raccolti e mostrati nel messaggio
+di cache vuota se nessun file è caricabile.
+
+I long string Lua nel campo `contenuto` possono usare qualsiasi livello
+di escape (`[[]]`, `[=[]=]`, `[==[]==]`, ecc.) — il modulo non deve
+gestirli esplicitamente perché Lua li interpreta nativamente.

@@ -1,0 +1,243 @@
+<includeonly>{{#invoke:VociRecenti|main}}</includeonly><noinclude>
+{{Avviso|Questo template mostra le voci più recenti create su Wikipedia}}
+
+== Descrizione ==
+Il template '''VociRecenti''' visualizza le voci più recenti create su Wikipedia italiana con possibilità di filtrare per categorie, titolo, contenuto testuale e data, con diverse modalità di visualizzazione.
+
+'''Funzionamento:''' Un bot aggiorna periodicamente [[Modulo:VociRecenti/Dati]] con le ultime voci create (contenuto completo). Il template legge questi dati e applica i filtri richiesti.
+
+== Sintassi ==
+<pre>
+{{VociRecenti
+|num=
+|AndCat=
+|OrCat=
+|Title=
+|Text=
+|TextRegExp=
+|DataFine=
+|Disp=
+}}
+</pre>
+
+== Parametri ==
+
+=== Parametri numerici ===
+* '''num''' - Numero di voci da visualizzare. Se omesso sono visualizzate 10 voci. Il limite massimo dipende dal numero di voci nella cache (tipicamente 500).
+
+=== Parametri di filtro per categorie ===
+* '''AndCat''' - Categorie separate da virgole; la voce deve essere in TUTTE le categorie (condizione AND). Può anche essere indicata una sola categoria. Supporta match parziale case-insensitive.
+* '''OrCat''' - Categorie separate da virgole; la voce deve essere in ALMENO UNA categoria (condizione OR). Può anche essere indicata una sola categoria. Supporta match parziale case-insensitive.
+
+=== Parametri di filtro per contenuto ===
+* '''Title''' - Il titolo della voce deve corrispondere in tutto o in parte al testo indicato nel parametro. Ricerca case-insensitive con match parziale.
+* '''Text''' - Il contenuto della voce deve contenere il testo indicato nel parametro. Ricerca case-insensitive su tutto il contenuto della voce.
+* '''TextRegExp''' - Il contenuto della voce deve soddisfare l'espressione regolare indicata in questo parametro
+
+=== Parametri temporali ===
+* '''DataFine''' - Data espressa nel formato GG/MM/AAAA, prima della quale non devono essere cercate voci
+
+=== Parametri di visualizzazione ===
+* '''Disp''' - Modalità di visualizzazione dei risultati dell'output:
+** '''s''' (standard, default) = Solo voce con numero d'ordine
+** '''v''' (verbose) = Numero d'ordine, voce e data di creazione scritta in piccolo tra parentesi
+** '''o''' (only date) = Voce e data di creazione scritta in piccolo tra parentesi, senza numero d'ordine
+** '''t''' (title only) = Solo voce senza nient'altro
+
+== Comportamento ==
+* Il numero massimo di voci visualizzabili dipende dalla cache aggiornata dal bot (tipicamente 500 voci)
+* Se richiamato senza parametri, visualizzerà le ultime 10 voci create in modalità standard
+* I parametri di ricerca (AndCat, OrCat, Title, Text) utilizzano match parziale case-insensitive
+
+== Esempi ==
+
+=== Esempi base ===
+
+==== Ultime 20 voci ====
+<pre>{{VociRecenti|num=20}}</pre>
+
+==== Tutte le voci disponibili ====
+<pre>{{VociRecenti|num=500}}</pre>
+Visualizza tutte le voci nella cache (tipicamente 500)
+
+==== Cerca voci il cui titolo contiene "premio" ====
+<pre>{{VociRecenti|num=15|Title=premio}}</pre>
+Trova: "Premio Nobel", "Premio Pulitzer", "Premio Oscar", ecc.
+
+==== Cerca voci che contengono "Serie A" nel contenuto ====
+<pre>{{VociRecenti|num=10|Text=Serie A}}</pre>
+Trova voci che menzionano "Serie A" nel testo
+
+=== Esempi con filtri combinati ===
+
+==== Trova calciatori che hanno giocato in Serie A ====
+<pre>
+{{VociRecenti
+|num=50
+|AndCat=Calciatori
+|Text=Serie A
+|Disp=v
+}}
+</pre>
+
+==== Trova tutte le voci su premi ====
+<pre>
+{{VociRecenti
+|num=100
+|Title=premio
+|Disp=o
+}}
+</pre>
+
+==== Trova biografie di italiani ====
+<pre>
+{{VociRecenti
+|num=200
+|AndCat=Biografie,italiani
+|Disp=v
+}}
+</pre>
+
+==== Trova film europei ====
+<pre>
+{{VociRecenti
+|num=50
+|AndCat=Film
+|OrCat=italiano,francese,tedesco,spagnolo
+|Disp=s
+}}
+</pre>
+
+=== Esempi avanzati ===
+
+==== Tutte le voci su sport che menzionano "Olimpiadi" ====
+<pre>
+{{VociRecenti
+|num=100
+|OrCat=Calcio,Atletica,Nuoto,Ciclismo
+|Text=Olimpiadi
+|Disp=v
+}}
+</pre>
+
+==== Tutte le località il cui titolo contiene "San" ====
+<pre>
+{{VociRecenti
+|num=200
+|AndCat=Comuni
+|Title=San
+|Disp=t
+}}
+</pre>
+
+==== Con espressione regolare - trova biografie con date ====
+<pre>
+{{VociRecenti
+|num=100
+|AndCat=Biografie
+|TextRegExp=\d{4}\s*[-–]\s*\d{4}
+|Disp=v
+}}
+</pre>
+
+==== Combina titolo E contenuto ====
+<pre>
+{{VociRecenti
+|num=50
+|Title=Chiesa
+|Text=gotico
+|Disp=o
+}}
+</pre>
+Trova chiese con architettura gotica menzionata nel testo
+
+=== Esempi per portali e progetti ===
+
+==== Portale Sport ====
+<pre>
+=== Nuovi atleti italiani ===
+{{VociRecenti
+|num=50
+|AndCat=italiani
+|OrCat=Calciatori,Ciclisti,Nuotatori
+|Disp=o
+}}
+</pre>
+
+==== Progetto Cinema ====
+<pre>
+=== Film con premi ===
+{{VociRecenti
+|num=100
+|AndCat=Film
+|Text=premio
+|Disp=v
+}}
+</pre>
+
+==== Monitoraggio voci di qualità ====
+<pre>
+=== Tutte le voci scientifiche recenti ===
+{{VociRecenti
+|num=500
+|OrCat=Fisica,Chimica,Biologia
+|DataFine=01/01/2025
+|Disp=v
+}}
+</pre>
+
+== Differenze tra Title e Text ==
+
+{| class="wikitable"
+! Parametro !! Dove cerca !! Esempio !! Trova
+|-
+| '''Title''' || Solo nel titolo || <code>Title=premio</code> || "Premio Nobel", "Premio Oscar"
+|-
+| '''Text''' || In tutto il contenuto || <code>Text=premio</code> || Qualsiasi voce che menzioni "premio" nel testo
+|-
+| Entrambi || Titolo E contenuto || <code>Title=Chiesa&#124;Text=gotico</code> || Chiesa con "gotico" nel testo
+|}
+
+== Note tecniche ==
+* I dati sono aggiornati periodicamente dal bot (tipicamente ogni ora)
+* Il bot scarica il '''contenuto completo''' di ogni voce
+* Il numero massimo di voci visualizzabili dipende dal parametro MAX_PAGES del bot (default 500)
+* Le voci redirect sono escluse automaticamente
+* Solo namespace principale (ns:0)
+* Tutti i parametri di ricerca testuale sono case-insensitive
+* AndCat, OrCat, Title, Text supportano match parziale
+* Non c'è più un limite fisso di 100 voci - il limite è dato dalla cache
+
+== Configurazione ==
+Questo template richiede:
+# [[Modulo:VociRecenti]] - Modulo Lua principale (v5.0 o superiore)
+# [[Modulo:VociRecenti/Dati]] - Dati aggiornati da bot (v2.0 o superiore)
+# Un bot configurato per aggiornare periodicamente i dati con contenuto completo
+
+Per aumentare il numero di voci disponibili, modificare il parametro MAX_PAGES nel bot (default 500).
+
+== Changelog ==
+
+'''Versione 5.0''' (Febbraio 2025)
+* ✨ Aggiunto parametro '''Title''' per cercare nel titolo
+* ✨ Parametro '''Text''' ora cerca in tutto il contenuto (non più solo titolo)
+* ✨ Bot aggiornato per scaricare contenuto completo
+* ✨ '''Rimosso limite di 100 voci''' - ora il limite dipende solo dalla cache
+* 📝 Documentazione aggiornata con nuovi esempi
+
+'''Versione 4.0'''
+* Aggiunto match parziale per AndCat e OrCat
+
+'''Versione 3.0'''
+* Aggiunto parametro Disp con 4 modalità
+
+== Vedi anche ==
+* [[Speciale:PaginePiùRecenti]] - Pagina speciale MediaWiki
+* [[Modulo:VociRecenti]] - Codice sorgente Lua
+* [[Modulo:VociRecenti/Dati]] - Dati cache
+* [[Template:NuoveVoci]] - Template alternativo
+
+== Categorie ==
+[[Categoria:Template di utilità]]
+[[Categoria:Template che usano Modulo:VociRecenti]]
+</noinclude>

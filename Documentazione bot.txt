@@ -1,0 +1,153 @@
+== Bot VociRecenti — Documentazione ==
+
+Il bot mantiene una cache delle voci di Wikipedia italiana create di recente, accessibile tramite il template <code><nowiki>{{VociRecenti}}</nowiki></code>. La cache permette al modulo Lua di filtrare e visualizzare le voci per categoria, titolo, testo e data senza dover interrogare l'API di Wikipedia ad ogni visualizzazione della pagina.
+
+=== Componenti ===
+
+{| class="wikitable"
+! File !! Scopo
+|-
+| <code>bot_voci_recenti_v85.py</code> || Bot principale: raccoglie le voci e aggiorna la cache
+|-
+| <code>PuliziaCache.py</code> || Script di pulizia: rimuove voci non più valide dalla cache
+|-
+| <code>Modulo:VociRecenti</code> || Modulo Lua: legge la cache e risponde alle chiamate del template
+|-
+| <code>Modulo:VociRecenti/Dati1..N</code> || File cache: dati delle voci in formato Lua
+|-
+| <code>Utente:BotVociRecenti/CacheMoved</code> || Lista manuale di voci da aggiungere alla cache
+|-
+| <code>Utente:BotVociRecenti/CacheParsed</code> || Flag: indica se la cache manuale è già stata processata
+|-
+| <code>cleanup_state.json</code> || File locale: tiene traccia se la pulizia è già stata eseguita nella fascia oraria
+|}
+
+=== Come funziona il bot ===
+
+Il bot viene eseguito periodicamente (es. ogni ora tramite pianificatore). Ad ogni esecuzione segue questi passi:
+
+==== STEP 1 — Pulizia automatica (AutoClean) ====
+
+Il bot verifica se deve eseguire <code>PuliziaCache.py</code> in base alla variabile <code>AutoClean</code>:
+
+* <code>Once</code> ''(default)'': la pulizia viene eseguita una sola volta nella fascia oraria definita da <code>AutoCleanTimeBegin</code> e <code>AutoCleanTimeEnd</code>. Fuori fascia il flag viene resettato, così alla prossima fascia la pulizia verrà rieseguita.
+* <code>Every</code>: la pulizia viene eseguita ad ogni run.
+* <code>None</code>: la pulizia non viene mai eseguita.
+
+==== STEP 2 — Caricamento cache esistente ====
+
+Il bot legge tutti i file <code>Modulo:VociRecenti/Dati1</code>, <code>Dati2</code>, ... e carica le voci già presenti in cache. I duplicati vengono ignorati.
+
+==== STEP 3 — Calcolo data limite ====
+
+Il bot calcola fino a che data accettare voci. Il limite è il massimo tra:
+
+* 30 giorni fa (<code>MAX_AGE_DAYS</code>)
+* la data della voce più vecchia già presente in cache
+
+Questo impedisce che la cache si espanda verso il passato ad ogni esecuzione.
+
+==== STEP 4 — Cache manuale (CacheMoved) ====
+
+Se la pagina <code>[[Utente:BotVociRecenti/CacheParsed]]</code> non contiene <code>True</code>, il bot legge <code>[[Utente:BotVociRecenti/CacheMoved]]</code>, una lista di voci da aggiungere manualmente (utile per voci create tramite spostamento da sandbox o namespace utente, che RecentChanges non intercetta come "nuove").
+
+Dopo aver processato la lista, il bot scrive <code>True</code> in <code>CacheParsed</code> per evitare di riprocessarla ad ogni esecuzione. Per far rileggere la lista basta cancellare o modificare <code>CacheParsed</code>.
+
+Il formato di <code>CacheMoved</code> supporta sia titoli semplici che righe copiate direttamente dal dump di [[Speciale:PaginePiùRecenti]]:
+<syntaxhighlight lang="text">
+Grimpella thaumastocheir
+16:32, 28 feb 2026 Altra voce (cron | modifica) [3 657 byte]
+</syntaxhighlight>
+
+==== STEP 5 — Ricerca nuove voci da RecentChanges ====
+
+Il bot interroga l'API di Wikipedia cercando '''tutte''' le voci create in NS0 con timestamp più recente della voce più recente già in cache. La ricerca si ferma non appena incontra voci più vecchie del riferimento (non c'è un limite sul numero di voci trovate, solo un limite di sicurezza sulle chiamate API).
+
+Vengono cercate anche le voci spostate nel NS0 da altri namespace (sandbox, namespace utente, ecc.) nello stesso intervallo temporale.
+
+==== STEP 6 — Unione, ordinamento e troncamento ====
+
+Tutte le voci (nuove + cache esistente + cache manuale) vengono unite, ordinate per data di creazione (dalla più recente alla più vecchia) e troncate al valore massimo <code>MAX_PAGES</code> (default: 3000), rimuovendo sempre le più vecchie.
+
+==== STEP 7 — Salvataggio ====
+
+Le voci vengono suddivise in file da max <code>MAX_CHARS_PER_FILE</code> caratteri (default: ~1,5 MB) e salvate in <code>Modulo:VociRecenti/Dati1</code>, <code>Dati2</code>, ecc. I file in eccesso rispetto al necessario vengono svuotati automaticamente.
+
+=== Script di pulizia (PuliziaCache.py) ===
+
+Eseguito automaticamente dal bot (o manualmente), rimuove dalla cache:
+
+# '''Duplicati''' — mantiene la copia più recente
+# '''Voci fuori NS0''' — voci finite per errore in namespace sbagliato
+# '''Voci cancellate o redirect''' — verifica l'esistenza attuale su Wikipedia
+# '''Voci troppo vecchie''' — create più di <code>MAX_AGE_DAYS</code> giorni fa
+
+La pulizia usa il timestamp già presente in cache per il controllo dell'età (nessuna chiamata API aggiuntiva), mentre fa chiamate API per verificare esistenza e namespace.
+
+=== Modulo Lua (Modulo:VociRecenti) ===
+
+Il modulo legge automaticamente tutti i file <code>Dati1</code>, <code>Dati2</code>, ... e li unisce in memoria. Usa <code>require()</code> invece di <code>mw.loadData()</code> per gestire file di grandi dimensioni. Espone la funzione <code>main</code> richiamabile dal template con i seguenti parametri:
+
+{| class="wikitable"
+! Parametro !! Descrizione
+|-
+| <code>num</code> || Numero di voci da mostrare (default: 10)
+|-
+| <code>OrCat</code> || Filtra per categoria (OR tra più valori separati da virgola)
+|-
+| <code>AndCat</code> || Filtra per categoria (AND: la voce deve avere tutte le categorie)
+|-
+| <code>Title</code> || Filtra per parola nel titolo (<code><nowiki>|</nowiki></code> come OR)
+|-
+| <code>Text</code> || Filtra per parola nel testo (<code><nowiki>|</nowiki></code> come OR)
+|-
+| <code>TextRegExp</code> || Filtra per espressione regolare nel testo
+|-
+| <code>CaseSensitive</code> || <code>on</code>/<code>off</code> per la ricerca regex (default: off)
+|-
+| <code>DataFine</code> || Mostra solo voci create dopo questa data (formato gg/mm/aaaa)
+|-
+| <code>And</code> || <code>on</code>/<code>off</code>: se off i filtri si combinano in OR anziché AND (default: on)
+|-
+| <code>Disp</code> || Formato output: <code>s</code>=numerato, <code>v</code>=numerato con data, <code>t</code>=puntato, <code>o</code>=puntato con data
+|}
+
+=== Stato sviluppo ===
+
+'''Versione corrente: bot v8.5 / PuliziaCache aggiornato al parser v8.3'''
+
+==== Cronologia versioni ====
+
+{| class="wikitable"
+! Versione !! Modifica principale
+|-
+| v8.0 || Separazione pulizia in script esterno, sistema CacheParsed, controllo duplicati
+|-
+| v8.1 || Filtro data creazione: scarta voci più vecchie del limite calcolato dinamicamente
+|-
+| v8.2 || Fix parser Lua: conteggio bilanciato delle graffe invece di regex fragile
+|-
+| v8.3 || Fix parser Lua: graffe dentro long string Lua non sbilanciano più il parser. Risolveva il problema per cui il bot leggeva ~2400 voci invece di ~2880 dalla cache
+|-
+| v8.4 || Sistema AutoClean con fascia oraria configurabile e file di stato locale JSON
+|-
+| v8.5 || Fix logica RecentChanges: raccoglie TUTTE le voci nuove fino al timestamp di riferimento, troncamento a MAX_PAGES solo alla fine dopo unione e ordinamento
+|}
+
+==== Problemi noti / possibili miglioramenti futuri ====
+
+* <code>get_moved_to_ns0</code> usa un limite fisso di 5000 voci nei log di spostamento.
+* Il parser Lua in Python è custom: funziona sui file generati dal bot ma potrebbe avere problemi con file modificati manualmente in modo non standard.
+* Se sarà risolto dagli sviluppatori di MediaWiki il problema di <code>RecentChanges</code> in modo che restituisca le voci create in NS0 anche quando sono spostate da altri namespace, potrà essere automatizzata anche la cache manuale.
+
+=== Parametri di configurazione principali ===
+
+<syntaxhighlight lang="python">
+MAX_PAGES = 3000              # Numero massimo di voci in cache
+MAX_CHARS_PER_FILE = 1500000  # Dimensione massima per file cache (~1,5 MB)
+MAX_AGE_DAYS = 30             # Età massima delle voci in giorni
+AutoClean = 'Once'            # 'Once' | 'Every' | 'None'
+AutoCleanTimeBegin = '03:00'  # Inizio fascia oraria pulizia
+AutoCleanTimeEnd   = '05:00'  # Fine fascia oraria pulizia
+MAX_ITERATIONS = 400          # Limite chiamate API RecentChanges (sicurezza)
+</syntaxhighlight>

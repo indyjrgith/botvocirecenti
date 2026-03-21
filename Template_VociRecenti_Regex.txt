@@ -1,0 +1,372 @@
+== Guida alle Espressioni Regolari in TextRegExp ==
+
+Questa pagina spiega come usare correttamente le espressioni regolari (regex) nel parametro '''TextRegExp''' del template {{tl|VociRecenti}}.
+
+=== Caratteristiche TextRegExp ===
+
+==== Case-insensitive ====
+'''Le ricerche regex sono case-insensitive''' (non distinguono maiuscole/minuscole).
+
+Esempio: <code>nobel</code> trova sia "Nobel" che "NOBEL" che "nobel".
+
+==== Il carattere | (pipe) ====
+
+'''PROBLEMA:''' In MediaWiki, il carattere <code>|</code> separa i parametri del template.
+
+'''SOLUZIONE 1 - Usa {{((}}!{{))}}''' (raccomandata):
+
+<pre>
+{{VociRecenti|TextRegExp=calcio{{!}}tennis}}
+</pre>
+
+Il template {{tl|!}} viene sostituito automaticamente con <code>|</code>.
+
+'''SOLUZIONE 2 - Usa | direttamente''' (con attenzione):
+
+<pre>
+{{VociRecenti|TextRegExp=calcio|tennis}}
+</pre>
+
+⚠️ '''ATTENZIONE:''' Questo funziona SOLO se <code>tennis</code> non è un parametro esistente del template. Se in futuro si aggiunge un parametro chiamato "tennis", questa sintassi smetterà di funzionare!
+
+'''Raccomandata:''' Usa sempre {{tl|!}} per sicurezza.
+
+==== Esempi con | ====
+
+'''Cerca "calcio" O "tennis":'''
+<pre>
+{{VociRecenti|num=20|TextRegExp=calcio{{!}}tennis|Disp=v}}
+</pre>
+
+'''Cerca date con formato diverso:'''
+<pre>
+{{VociRecenti|TextRegExp=%d%d/%d%d/%d%d%d%d{{!}}%d%d%d%d-%d%d-%d%d}}
+</pre>
+
+'''Cerca "Premio Nobel" O "Premio Pulitzer":'''
+<pre>
+{{VociRecenti|num=15|TextRegExp=Premio Nobel{{!}}Premio Pulitzer|Disp=o}}
+</pre>
+
+=== Importante: Lua Pattern vs Regex Standard ===
+
+⚠️ '''ATTENZIONE''': Il modulo Lua usa '''pattern Lua''', non regex PCRE standard!
+
+==== Differenze principali ====
+
+{| class="wikitable"
+! Regex Standard !! Lua Pattern !! Descrizione
+|-
+| <code>\d</code> || <code>%d</code> || Cifra (0-9)
+|-
+| <code>\w</code> || <code>%w</code> || Carattere alfanumerico
+|-
+| <code>\s</code> || <code>%s</code> || Spazio bianco
+|-
+| <code>\D</code> || <code>%D</code> || Non-cifra
+|-
+| <code>\W</code> || <code>%W</code> || Non-alfanumerico
+|-
+| <code>\S</code> || <code>%S</code> || Non-spazio
+|-
+| <code>{4}</code> || <code>%d%d%d%d</code> || Ripetizione esatta (non supportata)
+|-
+| <code>{2,4}</code> || Non supportato || Ripetizione con range
+|}
+
+==== Esempi di conversione ====
+
+'''SBAGLIATO''' (sintassi PCRE):
+<pre>
+{{VociRecenti|TextRegExp=\d{4}}}
+</pre>
+
+'''CORRETTO''' (sintassi Lua):
+<pre>
+{{VociRecenti|TextRegExp=%d%d%d%d}}
+</pre>
+
+Oppure per "una o più cifre":
+<pre>
+{{VociRecenti|TextRegExp=%d+}}
+</pre>
+
+=== Caratteri Speciali in Lua Pattern ===
+
+{| class="wikitable"
+! Carattere !! Significato !! Esempio !! Trova
+|-
+| <code>.</code> || Qualsiasi carattere || <code>a.c</code> || abc, a1c, a c
+|-
+| <code>*</code> || 0 o più ripetizioni || <code>%d*</code> || '', '1', '123'
+|-
+| <code>+</code> || 1 o più ripetizioni || <code>%d+</code> || '1', '123'
+|-
+| <code>?</code> || 0 o 1 occorrenza || <code>colou?r</code> || color, colour
+|-
+| <code>^</code> || Inizio stringa || <code>^Inizio</code> || Testo che inizia con "Inizio"
+|-
+| <code>$</code> || Fine stringa || <code>fine$</code> || Testo che finisce con "fine"
+|-
+| <code>[...]</code> || Classe di caratteri || <code>[0-9]+</code> || Una o più cifre
+|-
+| <code>(...)</code> || Gruppo di cattura || <code>(19{{!}}20)%d%d</code> || 1990, 2024
+|-
+| <code>%.</code> || Punto letterale || <code>%d+%.%d+</code> || 3.14, 10.5
+|-
+| <code>{{!}}</code> || OR (pipe) || <code>gatto{{!}}cane</code> || gatto o cane
+|}
+
+=== Pattern Comuni ===
+
+==== Date e anni ====
+
+'''Anno (4 cifre):'''
+<pre>
+{{VociRecenti|TextRegExp=%d%d%d%d}}
+</pre>
+
+'''Anni 1900-2099:'''
+<pre>
+{{VociRecenti|TextRegExp=(19{{!}}20)%d%d}}
+</pre>
+
+'''Data formato GG/MM/AAAA:'''
+<pre>
+{{VociRecenti|TextRegExp=%d%d/%d%d/%d%d%d%d}}
+</pre>
+
+'''Data formato AAAA-MM-GG:'''
+<pre>
+{{VociRecenti|TextRegExp=%d%d%d%d-%d%d-%d%d}}
+</pre>
+
+'''Intervalli di anni (es. 1990-2000):'''
+<pre>
+{{VociRecenti|TextRegExp=%d%d%d%d%s*[-–]%s*%d%d%d%d}}
+</pre>
+Trova: 1990-2000, 1990 – 2000, 1990–2000
+
+'''Date in vari formati (OR):'''
+<pre>
+{{VociRecenti|TextRegExp=%d%d/%d%d/%d%d%d%d{{!}}%d%d%d%d-%d%d-%d%d}}
+</pre>
+
+==== Numeri ====
+
+'''Qualsiasi numero:'''
+<pre>
+{{VociRecenti|TextRegExp=%d+}}
+</pre>
+
+'''Numero decimale:'''
+<pre>
+{{VociRecenti|TextRegExp=%d+%.%d+}}
+</pre>
+
+'''Numero con migliaia:'''
+<pre>
+{{VociRecenti|TextRegExp=%d+%.%d%d%d}}
+</pre>
+
+'''Codice postale italiano (5 cifre):'''
+<pre>
+{{VociRecenti|TextRegExp=%d%d%d%d%d}}
+</pre>
+
+==== Testo ====
+
+'''Parola che inizia con maiuscola:'''
+<pre>
+{{VociRecenti|TextRegExp=[A-Z][a-z]+}}
+</pre>
+
+'''Parola in maiuscolo:'''
+<pre>
+{{VociRecenti|TextRegExp=[A-Z]+}}
+</pre>
+
+'''Citazione tra virgolette:'''
+<pre>
+{{VociRecenti|TextRegExp="[^"]+"}}
+</pre>
+
+'''Testo tra parentesi:'''
+<pre>
+{{VociRecenti|TextRegExp=%([^%)]+%)}}
+</pre>
+
+==== URL e link ====
+
+'''URL HTTP/HTTPS:'''
+<pre>
+{{VociRecenti|TextRegExp=https?://[^%s]+}}
+</pre>
+
+'''Link wiki:'''
+<pre>
+{{VociRecenti|TextRegExp=%[%[[^%]]+%]%]}}
+</pre>
+
+==== Coordinate geografiche ====
+
+'''Coordinate con gradi, primi, secondi:'''
+<pre>
+{{VociRecenti|TextRegExp=%d+[°º]%s*%d+['′]%s*%d+["″]}}
+</pre>
+
+=== Esempi Completi ===
+
+==== Biografie con date di nascita e morte ====
+
+<pre>
+{{VociRecenti
+|num=20
+|AndCat=Biografie
+|TextRegExp=%d%d%d%d%s*[-–]%s*%d%d%d%d
+|Disp=v
+}}
+</pre>
+
+==== Voci su premi (Nobel o Pulitzer) ====
+
+<pre>
+{{VociRecenti
+|num=15
+|TextRegExp=Premio Nobel{{!}}Premio Pulitzer
+|Disp=o
+}}
+</pre>
+
+==== Località italiane con codice postale ====
+
+<pre>
+{{VociRecenti
+|num=25
+|AndCat=Comuni
+|TextRegExp=%d%d%d%d%d
+}}
+</pre>
+
+==== Voci scientifiche con formule chimiche ====
+
+<pre>
+{{VociRecenti
+|num=30
+|OrCat=Chimica,Fisica
+|TextRegExp=[A-Z][a-z]?%d*
+}}
+</pre>
+Trova: H2O, CO2, NaCl, Fe, C6H12O6
+
+==== Articoli con link esterni ====
+
+<pre>
+{{VociRecenti
+|num=20
+|TextRegExp=https?://
+|Disp=t
+}}
+</pre>
+
+==== Voci con numeri di telefono italiani ====
+
+<pre>
+{{VociRecenti
+|num=10
+|TextRegExp=%+?39%s*%d+
+}}
+</pre>
+
+=== Risoluzione Problemi ===
+
+==== La regex non funziona ====
+
+'''Verifica 1: Usi sintassi Lua?'''
+* ❌ <code>\d</code> → ✅ <code>%d</code>
+* ❌ <code>\s</code> → ✅ <code>%s</code>
+* ❌ <code>{4}</code> → ✅ ripeti 4 volte
+
+'''Verifica 2: Hai escapato i caratteri speciali?'''
+* Punto letterale: <code>%.</code> non <code>.</code>
+* Parentesi: <code>%(</code> e <code>%)</code>
+* Quadre: <code>%[</code> e <code>%]</code>
+
+'''Verifica 3: Usi {{((}}!{{))}} per il pipe?'''
+* ❌ <code>|</code> → ✅ <code>{{!}}</code>
+
+==== Risultati inattesi ====
+
+'''Pattern troppo generico?'''
+
+Invece di:
+<pre>
+{{VociRecenti|TextRegExp=.+}}
+</pre>
+
+Usa pattern più specifico:
+<pre>
+{{VociRecenti|TextRegExp=%d%d%d%d}}
+</pre>
+
+'''Serve case-sensitive?'''
+
+Lua pattern di default è case-sensitive. Per ignorare maiuscole/minuscole, usa classi:
+<pre>
+[Cc]alcio  invece di  calcio
+</pre>
+
+=== Testare le Regex ===
+
+==== Sandbox di test ====
+
+Crea una pagina di prova tipo [[Utente:NomeTuo/Sandbox]] con:
+
+<pre>
+== Test Regex ==
+
+=== Test 1: Anni ===
+{{VociRecenti|num=5|TextRegExp=%d%d%d%d}}
+
+=== Test 2: OR con pipe ===
+{{VociRecenti|num=5|TextRegExp=calcio{{!}}tennis}}
+
+=== Test 3: Date ===
+{{VociRecenti|num=5|TextRegExp=%d%d/%d%d/%d%d%d%d}}
+</pre>
+
+Verifica che i risultati siano quelli attesi.
+
+=== Tabella di Riferimento Rapido ===
+
+{| class="wikitable"
+! Vuoi cercare !! Pattern Lua !! Esempio completo
+|-
+| Anno || <code>%d%d%d%d</code> || <code><nowiki>{{VociRecenti|TextRegExp=%d%d%d%d}}</nowiki></code>
+|-
+| Data GG/MM/AAAA || <code>%d%d/%d%d/%d%d%d%d</code> || <code><nowiki>{{VociRecenti|TextRegExp=%d%d/%d%d/%d%d%d%d}}</nowiki></code>
+|-
+| OR tra parole || <code>parola1{{!}}parola2</code> || <code><nowiki>{{VociRecenti|TextRegExp=calcio{{!}}tennis}}</nowiki></code>
+|-
+| Numero decimale || <code>%d+%.%d+</code> || <code><nowiki>{{VociRecenti|TextRegExp=%d+%.%d+}}</nowiki></code>
+|-
+| Testo tra virgolette || <code>"[^"]+"</code> || <code><nowiki>{{VociRecenti|TextRegExp="[^"]+"}} </nowiki></code>
+|-
+| URL || <code>https?://[^%s]+</code> || <code><nowiki>{{VociRecenti|TextRegExp=https?://[^%s]+}}</nowiki></code>
+|-
+| Maiuscola seguita da minuscole || <code>[A-Z][a-z]+</code> || <code><nowiki>{{VociRecenti|TextRegExp=[A-Z][a-z]+}}</nowiki></code>
+|}
+
+=== Link Utili ===
+
+* [https://www.lua.org/manual/5.1/manual.html#5.4.1 Lua Pattern Reference] (documentazione ufficiale)
+* {{tl|!}} - Template per il carattere pipe
+* [[Wikipedia:Pagina delle prove]] - Sandbox per test
+
+=== Vedi anche ===
+
+* [[Template:VociRecenti]]
+* [[Template:VociRecenti/Documentazione]]
+* [[Modulo:VociRecenti]]
+
+[[Categoria:Template VociRecenti|Regex]]
