@@ -2042,10 +2042,7 @@ def main():
     print(f"Bot VociRecenti v{VERSION} - RICERCA COMPLETA DA CUTOFF")
     print("=" * 60)
 
-    if BOT_PASSWORD == 'inserisci_password_qui':
-        print("ERRORE: Inserisci credenziali")
-        tee.close()
-        return
+          return
 
     run_start = datetime.now()
     print(f"  Avvio: {run_start.strftime('%H:%M:%S')}")
@@ -2064,7 +2061,7 @@ def main():
     print(f"\nControllo PuliziaCache.py...")
     pulizia_ok = check_pulizia_version()
 
-    print(f"\nLogin come {BOT_USERNAME}...")
+    print("\nLogin come BotVociRecenti...")
     try:
         if not SITE.logged_in():
             SITE.login()

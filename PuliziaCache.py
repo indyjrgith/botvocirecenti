@@ -92,7 +92,7 @@ def main():
     log(f"Avvio: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     log('=' * 60)
 
-    print(f"\nLogin come {BOT_USERNAME}...")
+    print("\nLogin come BotVociRecenti...")
     if not SITE.logged_in():
         SITE.login()
     print(f"OK - Login: {SITE.username()}\n")
