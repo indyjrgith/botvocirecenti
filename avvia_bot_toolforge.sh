@@ -7,6 +7,7 @@
 #   ./avvia_bot_toolforge.sh 0h12m        -> ogni ora, al minuto 12
 #   ./avvia_bot_toolforge.sh 2h15m        -> ogni 2 ore, al minuto 15
 #   ./avvia_bot_toolforge.sh stop         -> ferma il job schedulato
+#   ./avvia_bot_toolforge.sh logs         -> monitora i log in tempo reale
 
 # ============================================================
 # CONFIGURAZIONE
@@ -99,6 +100,31 @@ install_schedule() {
 }
 
 # ------------------------------------------------------------
+# Funzione: mostra i log in tempo reale
+# ------------------------------------------------------------
+show_logs() {
+    local log_scheduled=~/"${JOB_NAME}.out"
+    local log_oneoff=~/"${JOB_NAME_ONEOFF}.out"
+
+    if [ -f "$log_scheduled" ]; then
+        echo -e "${CYAN}Monitoraggio log job schedulato '${JOB_NAME}'...${NC}"
+        echo -e "  File: ${YELLOW}${log_scheduled}${NC}"
+        echo -e "  (Ctrl+C per uscire)"
+        echo ""
+        tail -f "$log_scheduled"
+    elif [ -f "$log_oneoff" ]; then
+        echo -e "${CYAN}Monitoraggio log job one-off '${JOB_NAME_ONEOFF}'...${NC}"
+        echo -e "  File: ${YELLOW}${log_oneoff}${NC}"
+        echo -e "  (Ctrl+C per uscire)"
+        echo ""
+        tail -f "$log_oneoff"
+    else
+        echo -e "${YELLOW}Nessun file di log trovato.${NC}"
+        echo -e "  Assicurati che il bot sia stato avviato con questo script."
+    fi
+}
+
+# ------------------------------------------------------------
 # Funzione: ferma il job schedulato
 # ------------------------------------------------------------
 stop_schedule() {
@@ -151,6 +177,12 @@ parse_param() {
 # ============================================================
 # MAIN
 # ============================================================
+
+# --- logs: mostra i log in tempo reale ---
+if [ "$1" = "logs" ]; then
+    show_logs
+    exit 0
+fi
 
 # --- stop: ferma il job schedulato ---
 if [ "$1" = "stop" ]; then
