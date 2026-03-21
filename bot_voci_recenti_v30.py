@@ -2042,8 +2042,6 @@ def main():
     print(f"Bot VociRecenti v{VERSION} - RICERCA COMPLETA DA CUTOFF")
     print("=" * 60)
 
-          return
-
     run_start = datetime.now()
     print(f"  Avvio: {run_start.strftime('%H:%M:%S')}")
 
