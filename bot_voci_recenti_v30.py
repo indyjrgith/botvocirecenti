@@ -132,6 +132,10 @@ import os
 import subprocess
 import sys
 import logging
+import os
+os.environ['TZ'] = 'Europe/Rome'
+import time
+time.tzset()
 
 # ========================================
 # CONFIGURAZIONE
