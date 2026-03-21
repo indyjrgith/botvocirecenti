@@ -1,0 +1,328 @@
+# RIASSUNTO TECNICO - Bot VociRecenti v8.0
+## Continuazione sviluppo da chat precedente
+
+---
+
+## CONTESTO GENERALE
+
+Sistema per mantenere cache di voci recenti di Wikipedia italiana:
+- **Bot principale**: Scarica voci recenti da RecentChanges e le salva in moduli Lua
+- **PuliziaCache.py**: Script separato per pulizia cache (duplicati, NS errati, voci cancellate)
+- **Cache manuale**: Pagina wiki per voci spostate da sandbox non rilevate automaticamente
+
+---
+
+## FILES ATTUALI
+
+### 1. bot_voci_recenti_v73.py (ULTIMA VERSIONE FUNZIONANTE)
+**Stato:** Funziona ma necessita refactoring per v8.0
+
+**Funzionalità attuali:**
+- Carica cache esistente da Modulo:VociRecenti/Dati1-N
+- Legge cache manuale da `Utente:BotVociRecenti/CacheMoved`
+- Parse automatico formato dump da Speciale:PagineRecenti
+- Verifica namespace e cerca voci in NS0
+- Scarica nuove voci da RecentChanges
+- Salva in file multipli (~1.5MB ciascuno)
+- Fix formattazione Lua con escape corretto
+
+**Problemi da risolvere:**
+- Contiene ancora logica di pulizia interna (da rimuovere)
+- Non verifica duplicati prima di aggiungere nuove voci
+- Non implementa sistema CacheParsed
+
+### 2. PuliziaCache.py (COMPLETATO E FUNZIONANTE)
+**Stato:** Pronto all'uso
+
+**Funzionalità:**
+1. Carica tutti i file Modulo:VociRecenti/Dati*
+2. Rimuove duplicati (mantiene più recente per timestamp)
+3. Rimuove voci con namespace ≠ 0
+4. Rimuove voci cancellate/redirect da Wikipedia
+5. Salva cache pulita
+
+**Note:** Può essere eseguito standalone o chiamato dal bot principale
+
+---
+
+## REQUISITI v8.0
+
+### A. RIMUOVERE dal bot principale
+```python
+# DA ELIMINARE COMPLETAMENTE:
+REMOVE_DELETED = True
+REMOVE_REDIRECTS = True  
+REMOVE_WRONG_NAMESPACE = True
+
+# E tutta la logica di pulizia cache interna (cicli che verificano exists(), isRedirect(), namespace)
+```
+
+### B. AGGIUNGERE parametri configurazione
+```python
+# Nuovo parametro
+RUN_CLEANUP = False  # Default: False, se True esegue PuliziaCache.py all'inizio
+
+# Pagine cache manuale
+CACHE_MOVED_PAGE = 'Utente:BotVociRecenti/CacheMoved'
+CACHE_PARSED_PAGE = 'Utente:BotVociRecenti/CacheParsed'
+```
+
+### C. IMPLEMENTARE logica CacheParsed
+
+**Scopo:** Evitare di processare più volte la stessa cache manuale
+
+**Logica richiesta:**
+```python
+def check_should_load_manual_cache():
+    """
+    Verifica se caricare la cache manuale
+    Returns: True se deve essere caricata, False altrimenti
+    """
+    try:
+        page = pywikibot.Page(SITE, CACHE_PARSED_PAGE)
+        
+        # Se non esiste → deve essere caricata
+        if not page.exists():
+            return True
+        
+        # Se esiste ma contenuto ≠ "True" → deve essere caricata
+        content = page.text.strip()
+        if content != "True":
+            return True
+        
+        # Altrimenti già processata
+        return False
+    except:
+        # In caso di errore, carica per sicurezza
+        return True
+
+
+def mark_manual_cache_as_parsed():
+    """
+    Marca la cache manuale come già processata
+    """
+    try:
+        page = pywikibot.Page(SITE, CACHE_PARSED_PAGE)
+        page.text = "True"
+        page.save(summary="Bot: Cache manuale processata", minor=True)
+        print(f"  ✓ Marcata cache manuale come processata")
+    except Exception as e:
+        print(f"  ERRORE marcatura: {e}")
+```
+
+**Integrazione in main():**
+```python
+# DOPO aver caricato la cache esistente:
+
+should_load = check_should_load_manual_cache()
+
+if should_load:
+    print("Caricamento cache manuale...")
+    moved_pages = read_moved_pages_list(existing_titles)
+    
+    if moved_pages:
+        cached_pages.extend(moved_pages)
+        # Aggiorna existing_titles per evitare duplicati
+        for p in moved_pages:
+            existing_titles.add(p['titolo'])
+        
+        # Marca come processata
+        mark_manual_cache_as_parsed()
+else:
+    print("Cache manuale già processata - skip")
+```
+
+### D. CHIAMARE PuliziaCache.py (se attivato)
+
+**All'inizio di main():**
+```python
+if RUN_CLEANUP:
+    print("Esecuzione pulizia cache...")
+    import subprocess
+    import sys
+    result = subprocess.run([sys.executable, 'PuliziaCache.py'], 
+                          capture_output=True, text=True)
+    print(result.stdout)
+    if result.returncode != 0:
+        print(f"ERRORE pulizia: {result.stderr}")
+```
+
+### E. PREVENIRE duplicati durante aggiunta voci
+
+**Nella funzione che scarica nuove voci:**
+```python
+# PRIMA di aggiungere una voce a new_pages:
+if title in existing_titles:
+    continue  # Skip, già presente
+
+# Dopo averla aggiunta:
+existing_titles.add(title)
+```
+
+**Verificare in TUTTI i punti dove si aggiungono voci:**
+- Scaricamento da RecentChanges
+- Caricamento da cache manuale
+- Qualsiasi altra fonte
+
+---
+
+## FLUSSO LOGICO v8.0
+
+```
+1. Login
+2. [Opzionale] RUN_CLEANUP=True → Esegui PuliziaCache.py
+3. Carica cache esistente → cached_pages, existing_titles
+4. Verifica CacheParsed:
+   - Se non esiste O ≠ "True":
+     a. Carica CacheMoved
+     b. Aggiungi a cached_pages (solo se non in existing_titles)
+     c. Aggiorna existing_titles
+     d. Marca CacheParsed = "True"
+   - Altrimenti: skip
+5. Trova timestamp range (più vecchio/recente)
+6. Cerca nuove voci da RecentChanges
+   - Per ogni voce: verificare if title not in existing_titles
+   - Dopo aggiunta: existing_titles.add(title)
+7. Unisci: cached_pages + new_pages
+8. Ordina per timestamp (più recenti prima)
+9. Mantieni top MAX_PAGES
+10. Salva in file multipli
+```
+
+---
+
+## FORMATO CACHE MANUALE
+
+**File:** `Utente:BotVociRecenti/CacheMoved`
+
+**Formati supportati:**
+
+1. **Titolo semplice:**
+```
+Grimpella thaumastocheir
+Megaleledone setebos
+```
+
+2. **Dump da Speciale:PagineRecenti:**
+```
+16:32, 28 feb 2026 Grimpella thaumastocheir (cron | modifica) [3 657 byte]
+11:25, 28 feb 2026 Megaleledone setebos (cron | modifica) [4 806 byte]
+```
+
+**Parsing:** Regex per estrarre titolo da dump:
+```python
+match = re.search(r'\d{2}:\d{2}, \d{1,2} \w+ \d{4} (.+?) \(cron \|', line)
+if match:
+    title = match.group(1).strip()
+```
+
+**Verifica namespace:** Se titolo estratto è in altro NS (es. Utente:), cercare in NS0:
+```python
+temp_page = pywikibot.Page(SITE, title)
+if temp_page.namespace() != 0:
+    base_name = temp_page.title(with_ns=False)
+    if '/' in base_name:
+        base_name = base_name.split('/')[-1]
+    voce_page = pywikibot.Page(SITE, base_name, ns=0)
+```
+
+---
+
+## FILE DA MODIFICARE
+
+**Input files da usare:**
+- `bot_voci_recenti_v73.py` (base di partenza)
+- `PuliziaCache.py` (già completo, non modificare)
+
+**Output atteso:**
+- `bot_voci_recenti_v80.py` (versione finale)
+
+---
+
+## NOTE IMPLEMENTAZIONE
+
+### Escape Lua (già implementato correttamente in v7.3)
+```python
+def escape_for_lua_longstring(s):
+    level = 0
+    while f"]{'=' * level}]" in s:
+        level += 1
+    open_delim = f"[{'=' * level}["
+    close_delim = f"]{'=' * level}]"
+    return open_delim, close_delim
+```
+
+### Salvataggio con try-catch per voci corrotte
+```python
+for i, page in enumerate(pages_data):
+    try:
+        # Formattazione voce
+        lines.append(f"      titolo = [[{page['titolo']}]],")
+        # ...
+    except Exception as e:
+        print(f"  WARNING: Skip voce {page.get('titolo')}: {e}")
+        continue
+```
+
+---
+
+## CREDENZIALI (GIÀ PRESENTI NEL CODICE)
+
+```python
+BOT_USERNAME = 'IndyJrBot@Pywikibot'
+BOT_PASSWORD = 't1ej4nl6vp6up1fvqlu44n7da1m5j90d'
+```
+
+---
+
+## TESTING
+
+**Dopo implementazione v8.0, testare:**
+
+1. **Primo run con cache manuale:**
+   - Creare `Utente:BotVociRecenti/CacheMoved` con voci di test
+   - `CacheParsed` non deve esistere
+   - Eseguire bot → voci devono essere aggiunte
+   - `CacheParsed` deve contenere "True"
+
+2. **Secondo run:**
+   - Eseguire bot di nuovo
+   - Cache manuale NON deve essere riprocessata
+   - Log deve dire "Cache manuale già processata - skip"
+
+3. **Reset cache manuale:**
+   - Modificare `CacheMoved` con nuove voci
+   - Impostare `CacheParsed` a "False" o cancellarlo
+   - Eseguire bot → nuove voci devono essere aggiunte
+
+4. **Pulizia:**
+   - Impostare `RUN_CLEANUP = True`
+   - Aggiungere manualmente voci duplicate/corrotte alla cache
+   - Eseguire bot → duplicati devono essere rimossi
+
+5. **Prevenzione duplicati:**
+   - Verificare che voci già in cache non vengano ri-aggiunte
+   - Controllare log per messaggi "già in cache"
+
+---
+
+## PRIORITÀ MODIFICHE
+
+1. **ALTA:** Rimuovere logica pulizia interna
+2. **ALTA:** Implementare CacheParsed
+3. **ALTA:** Prevenire duplicati in aggiunta voci
+4. **MEDIA:** Aggiungere chiamata PuliziaCache.py
+5. **BASSA:** Pulizia codice e commenti
+
+---
+
+## DOMANDE DA CHIARIRE (se necessario)
+
+- ✅ CacheParsed: contenuto esatto "True" o accetta varianti?
+- ✅ Duplicati: mantenere più recente per timestamp (conferma)
+- ✅ Namespace: solo NS0 o anche altri specifici?
+- ✅ PuliziaCache.py: eseguire prima o dopo caricamento cache?
+
+---
+
+FINE RIASSUNTO - Pronto per nuova chat

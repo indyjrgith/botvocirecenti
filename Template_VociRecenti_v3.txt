@@ -1,0 +1,187 @@
+<includeonly>{{#invoke:VociRecenti|main}}</includeonly><noinclude>
+{{Avviso|Questo template mostra le voci più recenti create su Wikipedia}}
+
+== Descrizione ==
+Il template '''VociRecenti''' visualizza le voci più recenti create su Wikipedia italiana con possibilità di filtrare per categorie, testo e data, e diverse modalità di visualizzazione.
+
+'''Funzionamento:''' Un bot aggiorna periodicamente [[Modulo:VociRecenti/Dati]] con le ultime voci create. Il template legge questi dati e applica i filtri richiesti.
+
+== Sintassi ==
+<pre>
+{{VociRecenti
+|num=
+|AndCat=
+|OrCat=
+|Text=
+|TextRegExp=
+|DataFine=
+|Disp=
+}}
+</pre>
+
+== Parametri ==
+
+=== Parametri di filtro ===
+* '''num''' - Numero di voci da visualizzare (massimo 100, default 10)
+* '''AndCat''' - Categorie separate da virgole; la voce deve essere in TUTTE le categorie (condizione AND). Può anche essere indicata solo una categoria.
+* '''OrCat''' - Categorie separate da virgole; la voce deve essere in ALMENO UNA categoria (condizione OR). Può anche essere indicata solo una categoria.
+* '''Text''' - La voce deve contenere il testo indicato nel titolo
+* '''TextRegExp''' - Il contenuto della voce deve soddisfare l'espressione regolare indicata in questo parametro
+* '''DataFine''' - Data espressa nel formato GG/MM/AAAA, prima della quale non devono essere cercate voci
+
+=== Parametro di visualizzazione ===
+* '''Disp''' - Modalità di visualizzazione dei risultati dell'output:
+** '''s''' (standard, default) = Solo voce con numero d'ordine
+** '''v''' (verbose) = Numero d'ordine, voce e data di creazione scritta in piccolo tra parentesi
+** '''o''' (only date) = Voce e data di creazione scritta in piccolo tra parentesi, senza numero d'ordine
+** '''t''' (title only) = Solo voce senza nient'altro
+
+== Comportamento ==
+* Il template non visualizzerà mai più di 100 voci, anche se non vengono indicate limitazioni
+* Se richiamato senza parametri, visualizzerà le ultime 10 voci create in modalità standard
+
+== Esempi ==
+
+=== Esempi base ===
+
+==== Ultime 20 voci (modalità standard) ====
+<pre>{{VociRecenti|num=20}}</pre>
+
+Risultato:
+# [[Voce 1]]
+# [[Voce 2]]
+# ...
+
+==== Ultime 10 voci con date ====
+<pre>{{VociRecenti|num=10|Disp=v}}</pre>
+
+Risultato:
+# [[Voce 1]] <small>(15/02/2025 18:30)</small>
+# [[Voce 2]] <small>(15/02/2025 17:45)</small>
+# ...
+
+==== Solo titoli senza numerazione ====
+<pre>{{VociRecenti|num=15|Disp=t}}</pre>
+
+Risultato:
+* [[Voce 1]]
+* [[Voce 2]]
+* ...
+
+==== Titoli con date ma senza numeri ====
+<pre>{{VociRecenti|num=10|Disp=o}}</pre>
+
+Risultato:
+* [[Voce 1]] <small>(15/02/2025 18:30)</small>
+* [[Voce 2]] <small>(15/02/2025 17:45)</small>
+* ...
+
+=== Esempi con filtri ===
+
+==== Biografie recenti ====
+<pre>{{VociRecenti|num=15|AndCat=Biografie|Disp=v}}</pre>
+
+==== Voci su matematica O fisica ====
+<pre>{{VociRecenti|num=10|OrCat=Matematica,Fisica|Disp=s}}</pre>
+
+==== Calciatori italiani (solo titoli) ====
+<pre>{{VociRecenti|num=10|AndCat=Calciatori italiani|Disp=t}}</pre>
+
+==== Con filtro testuale ====
+<pre>{{VociRecenti|num=10|Text=premio Nobel|Disp=v}}</pre>
+
+==== Con limite temporale ====
+<pre>{{VociRecenti|num=15|DataFine=01/01/2025|Disp=o}}</pre>
+
+=== Esempi avanzati ===
+
+==== Combinazione complessa ====
+<pre>
+{{VociRecenti
+|num=25
+|AndCat=Biografie
+|OrCat=Politici italiani,Scienziati italiani
+|Text=premio
+|DataFine=01/06/2024
+|Disp=v
+}}
+</pre>
+
+==== Con espressione regolare ====
+<pre>{{VociRecenti|num=10|TextRegExp=\d{4}\s*[-–]\s*\d{4}|Disp=s}}</pre>
+Trova voci con anni nel formato "1950-2020"
+
+==== Per portali tematici ====
+<pre>
+=== Nuove biografie ===
+{{VociRecenti|num=5|AndCat=Biografie|Disp=o}}
+
+=== Nuove voci scientifiche ===
+{{VociRecenti|num=5|OrCat=Fisica,Chimica,Matematica|Disp=t}}
+</pre>
+
+== Confronto modalità di visualizzazione ==
+
+{| class="wikitable"
+! Modalità !! Codice !! Esempio output
+|-
+| Standard || <code>Disp=s</code> || # [[Voce esempio]]
+|-
+| Verbose || <code>Disp=v</code> || # [[Voce esempio]] <small>(15/02/2025 18:30)</small>
+|-
+| Only date || <code>Disp=o</code> || * [[Voce esempio]] <small>(15/02/2025 18:30)</small>
+|-
+| Title only || <code>Disp=t</code> || * [[Voce esempio]]
+|}
+
+== Casi d'uso ==
+
+=== Per pagine di progetto ===
+<pre>
+== Ultime voci create nel nostro progetto ==
+{{VociRecenti|num=20|AndCat=Progetto:Biografie|Disp=v}}
+</pre>
+
+=== Per portali ===
+<pre>
+== Novità in questo portale ==
+{{VociRecenti|num=10|OrCat=Categoria1,Categoria2,Categoria3|Disp=o}}
+</pre>
+
+=== Per liste tematiche ===
+<pre>
+== Nuovi film italiani ==
+{{VociRecenti|num=15|AndCat=Film italiani|Text=2025|Disp=t}}
+</pre>
+
+=== Per monitoraggio ===
+<pre>
+== Voci da controllare ==
+{{VociRecenti|num=30|Text=da controllare|Disp=s}}
+</pre>
+
+== Configurazione ==
+Questo template richiede:
+# [[Modulo:VociRecenti]] - Modulo Lua principale
+# [[Modulo:VociRecenti/Dati]] - Dati aggiornati da bot
+# Un bot configurato per aggiornare periodicamente i dati
+
+Per configurare il bot, consulta la documentazione completa.
+
+== Note tecniche ==
+* I dati sono aggiornati periodicamente dal bot (tipicamente ogni ora)
+* Massimo 100 voci visualizzabili per chiamata
+* Le voci redirect sono escluse automaticamente
+* Solo namespace principale (ns:0)
+* Il parametro '''Disp''' influenza solo la visualizzazione, non i filtri
+
+== Vedi anche ==
+* [[Speciale:PaginePiùRecenti]] - Pagina speciale MediaWiki
+* [[Modulo:VociRecenti]] - Codice sorgente
+* [[Modulo:VociRecenti/Dati]] - Dati cache
+* [[Template:NuoveVoci]] - Template alternativo (se disponibile)
+
+== Categorie ==
+[[Categoria:Template di utilità]]
+[[Categoria:Template che usano Modulo:VociRecenti]]
+</noinclude>

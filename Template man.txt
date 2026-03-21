@@ -1,0 +1,503 @@
+== Descrizione ==
+Il template '''VociRecenti''' visualizza le voci più recenti create su Wikipedia italiana con possibilità di filtrare per categorie, titolo, portali, template presenti e data, con possibilità di escludere contenuti.
+
+Il template è stato progettato specificamente per le esigenze di monitoraggio e visualizzazione delle ultime voci create da parte dei relativi progetti o portali a cui le voci create appartengono per area tematica. 
+
+Il template si serve di una cache contenente una struttura dati in formato [[Lua]] mantenuta aggiornata da un [[Wikipedia:Bot|Bot]], che contiene un certo numero delle voci più recenti create nel [[Aiuto:Namespace/Elenco|Namespace principale (ns0:)]] dell'enciclopedia.
+
+== Sintassi ==
+<pre>
+{{VociRecenti
+|num=
+|AndCat=
+|OrCat=
+|NoCat=
+|Title=
+|Text=
+|TextRegExp=
+|AndTemplate=
+|OrTemplate=
+|Portali=
+|CaseSensitive=
+|DataFine=
+|Disp=
+|And=
+|Order=
+|Timestamp=
+}}
+</pre>
+
+== Parametri ==
+
+=== Parametri numerici ===
+* '''num''' - Numero di voci da visualizzare (default 10). Nessun limite massimo (fino a capienza della cache).
+
+=== Parametri di filtro per categorie ===
+* '''AndCat''' - Categorie (match parziale, case-insensitive), ogni categoria va separata con una '''virgola'''. La voce deve essere in TUTTE le categorie elencate.
+* '''OrCat''' - Categorie (match parziale, case-insensitive), ogni categoria va separata con una '''virgola'''. La voce deve essere in ALMENO UNA categoria elencata.
+* '''NoCat''' - Categorie da '''escludere''' (match parziale, case-insensitive), separate da '''virgola'''. La voce viene esclusa se contiene ALMENO UNA delle categorie elencate. Viene applicato sempre in AND anche se <code>And=off</code>.
+
+=== Parametri di filtro per contenuto ===
+* '''Title''' - Il titolo deve contenere questo testo (match parziale, case-insensitive). '''Supporta | per OR''': <code>Title=Chiesa|Cattedrale</code> trova titoli con "Chiesa" OPPURE "Cattedrale".
+* '''Text''' - ''(Parzialmente deprecato)'' Cerca nei primi 100 caratteri della voce (case-insensitive). '''Supporta | per OR'''. Nelle versioni precedenti cercava nel testo completo; ora la cache non contiene più il testo completo. Per ricerche affidabili preferire '''AndTemplate=''', '''OrTemplate=''' o '''Portali='''.
+* '''TextRegExp''' - Espressione regolare Lua applicata su una stringa che concatena: categorie, nomi template, parametri template valorizzati e i primi 100 caratteri della voce. Case-insensitive di default.
+** '''Ricerca template''': <code>TextRegExp=%{%{Bio</code> non funziona più come prima — usare '''AndTemplate=Bio''' o '''OrTemplate=Bio'''
+** '''Ricerca portali''': <code>TextRegExp=Portale.*astronomia</code> funziona ancora bene perché "Portale" e "astronomia" sono entrambi nella stringa concatenata
+** '''OR semplice''': Usa <code>TextRegExp=nobel|pulitzer</code> (il <code>|</code> fuori dai gruppi funziona)
+** '''Gruppi OR con più termini''': Usa ''';''' come separatore '''dentro le parentesi''': <code>TextRegExp=portale.*(astronomia;stelle)</code>
+** '''Case-sensitive''': Aggiungi <code>CaseSensitive=on</code> se necessario
+* '''CaseSensitive''' - Rende TextRegExp case-sensitive (on/off, default: off).
+
+=== Parametri di filtro per template ===
+* '''AndTemplate''' - La voce deve contenere '''tutti''' i template elencati (match parziale, case-insensitive). Formato: <code>nome(par1;par2),nome2(par1)</code>
+** Il nome del template è cercato con match parziale: <code>Infobox cal</code> trova <code>Infobox calciatore</code>
+** I parametri tra parentesi sono i '''nomi''' dei parametri valorizzati (AND tra loro, opzionali)
+** Separatore template: ''',''' — separatore parametri: ''';'''
+** Esempio: <code>AndTemplate=Bio(Nazione;Attività)</code> trova voci con {{tl|Bio}} che abbiano sia <code>Nazione=</code> che <code>Attività=</code> valorizzati
+* '''OrTemplate''' - La voce deve contenere '''almeno uno''' dei template elencati. Stesso formato di AndTemplate.
+** Esempio: <code>OrTemplate=Infobox calciatore,Infobox allenatore</code>
+* '''Portali''' - La voce deve avere '''tutti''' i portali elencati nel template {{tl|Portale}} (logica AND). Più template <code>{{tl|Portale}}</code> nella stessa voce vengono considerati come uno solo.
+** Separatore: ''',''' — match parziale, case-insensitive
+** Esempio: <code>Portali=astronomia,stelle</code> trova voci che hanno sia il portale astronomia che stelle
+
+'''Nota importante sui separatori:'''
+* '''Pipe (|)''' in Title/Text = OR tra termini alternativi (es. <code>Title=Chiesa|Cattedrale</code>)
+* '''Pipe (|)''' in TextRegExp = OR tra pattern alternativi, ma '''solo fuori dalle parentesi'''
+* '''Punto e virgola (;)''' in TextRegExp = OR '''dentro i gruppi''' <code>(...)</code> (es. <code>(astro;stelle)</code>)
+* '''Virgola (,)''' in AndCat/OrCat/NoCat/Portali = lista di valori da verificare
+* '''Virgola (,)''' in AndTemplate/OrTemplate = separatore tra template
+* '''Punto e virgola (;)''' in AndTemplate/OrTemplate = separatore tra parametri dello stesso template
+
+=== Parametri temporali ===
+* '''DataFine''' - Data limite formato GG/MM/AAAA (mostra solo voci create dopo questa data)
+** Per usare una data relativa (esempio gli ultimi 4 giorni) usare <code><nowiki>|DataFine={{#timel:d/m/Y|-4 days}}</nowiki></code>
+
+=== Parametri di visualizzazione ===
+* '''Disp''' - Modalità visualizzazione:
+** '''s''' (standard) = Solo voce con numero d'ordine
+** '''v''' (verbose) = Numero, voce e data
+** '''o''' (only date) = Voce e data senza numero
+** '''t''' (title only) = Solo voce senza altro
+
+* '''Order''' - Criterio di ordinamento delle voci (default: '''data'''):
+** '''Order=data''' (default) = Ordine cronologico decrescente: dalla voce più recente alla più vecchia
+** '''Order=dataold''' = Ordine cronologico crescente: dalla voce più vecchia alla più recente
+** '''Order=alpha''' = Ordine alfabetico crescente per titolo (dalla A alla Z, senza distinzione tra lettere accentate e non accentate)
+
+* '''Timestamp''' - Mostra o nasconde la riga "Ultimo aggiornamento" in fondo alla lista (default: '''on'''):
+** '''Timestamp=on''' (default) = Mostra le informazioni sull'ultimo aggiornamento della cache
+** '''Timestamp=off''' = Nasconde le informazioni sull'ultimo aggiornamento
+
+=== Parametro logica di ricerca ===
+* '''And''' - Modalità di combinazione dei filtri (default: '''on''')
+** '''And=on''' (default) = '''Logica AND''' - La voce viene visualizzata SOLO se TUTTI i filtri sono soddisfatti contemporaneamente
+** '''And=off''' = '''Logica OR''' - La voce viene visualizzata se ALMENO UNO dei filtri è soddisfatto
+
+== Esempi ==
+
+=== Esempi base ===
+
+==== Ultime 20 voci ====
+<pre>{{VociRecenti|num=20}}</pre>
+
+==== Cerca nel titolo (singolo termine) ====
+<pre>{{VociRecenti|num=10|Title=Chiesa}}</pre>
+
+==== Cerca nel titolo (OR tra termini) ====
+<pre>{{VociRecenti|num=10|Title=Chiesa|Cattedrale|Basilica}}</pre>
+Trova titoli con "Chiesa" OPPURE "Cattedrale" OPPURE "Basilica"
+
+==== Cerca nel contenuto (singolo termine) ====
+<pre>{{VociRecenti|num=10|Text=gotico}}</pre>
+
+==== Cerca nel contenuto (OR tra termini) ====
+<pre>{{VociRecenti|num=10|Text=gotico|romanico|barocco}}</pre>
+Trova contenuti con "gotico" OPPURE "romanico" OPPURE "barocco"
+
+=== Esempi di ordinamento ===
+
+==== Voci in ordine alfabetico ====
+<pre>
+{{VociRecenti
+|num=20
+|OrCat=Calciatori
+|Order=alpha
+|Disp=t
+|Timestamp=off
+}}
+</pre>
+Mostra 20 calciatori in ordine alfabetico, senza data e senza riga di aggiornamento.
+
+==== Voci dalla più vecchia alla più recente ====
+<pre>
+{{VociRecenti
+|num=15
+|AndCat=Film
+|Order=dataold
+|Disp=v
+}}
+</pre>
+Mostra 15 film partendo dal più vecchio.
+
+==== Lista pulita senza informazioni di aggiornamento ====
+<pre>
+{{VociRecenti
+|num=10
+|OrCat=Musica
+|Timestamp=off
+}}
+</pre>
+Nasconde la riga "Ultimo aggiornamento" in fondo alla lista.
+
+=== Ricerca per template ===
+
+==== Voci con template Aeroporto ====
+<pre>
+{{VociRecenti
+|num=50
+|TextRegExp=%{%{Aeroporto
+|CaseSensitive=on
+|Disp=v
+}}
+</pre>
+'''Nota:''' Usa <code>%{%{</code> per le parentesi graffe e <code>CaseSensitive=on</code> per i template.
+
+==== Biografie (template Bio) ====
+<pre>
+{{VociRecenti
+|num=50
+|TextRegExp=%{%{ *Bio
+|CaseSensitive=on
+|DataFine={{#timel:d/m/Y|-4 days}}
+|Disp=v
+}}
+</pre>
+Biografie create negli ultimi 4 giorni.
+
+==== Voci con portale Aviazione ====
+<pre>
+{{VociRecenti
+|num=50
+|TextRegExp=Portale.*Aviazione
+|Disp=v
+}}
+</pre>
+'''Nota:''' Per i portali NON serve CaseSensitive=on, usa pattern flessibile perché il portale può essere in qualsiasi posizione del template {{tl|Portale}}.
+
+==== Voci con portale astronomia, sistema solare o stelle ====
+<pre>
+{{VociRecenti
+|num=50
+|And=off
+|TextRegExp=portale.*(astronomia;sistema solare;profondo cielo;stelle)
+|Disp=v
+}}
+</pre>
+'''Nota:''' Usa ''';''' come separatore dentro le parentesi, non '''|''' (che verrebbe interpretato da MediaWiki come separatore di parametri).
+
+=== Esempi con logica AND (default) ===
+
+==== Calciatori che hanno giocato in Serie A ====
+<pre>
+{{VociRecenti
+|num=20
+|AndCat=Calciatori
+|Text=Serie A
+|And=on
+|Disp=v
+}}
+</pre>
+Mostra SOLO voci che sono:
+* Categorizzate in "Calciatori" E
+* Contengono "Serie A" nel testo
+
+==== Chiese gotiche ====
+<pre>
+{{VociRecenti
+|num=15
+|Title=Chiesa
+|Text=gotico
+|And=on
+|Disp=o
+}}
+</pre>
+Mostra SOLO voci che:
+* Hanno "Chiesa" nel titolo E
+* Contengono "gotico" nel testo
+
+==== Film italiani recenti ====
+<pre>
+{{VociRecenti
+|num=30
+|AndCat=Film
+|OrCat=italian
+|DataFine=01/01/2025
+|And=on
+}}
+</pre>
+Mostra voci che:
+* Sono in categoria "Film" E
+* Sono in categoria "italiano" (o simile) E
+* Create dopo 01/01/2025
+
+=== Esempi con logica OR ===
+
+==== Voci su premi O che menzionano "Nobel" ====
+<pre>
+{{VociRecenti
+|num=25
+|Title=Premio
+|Text=Nobel
+|And=off
+|Disp=v
+}}
+</pre>
+Mostra voci che:
+* Hanno "Premio" nel titolo OPPURE
+* Contengono "Nobel" nel testo
+
+==== Sport O biografie ====
+<pre>
+{{VociRecenti
+|num=50
+|OrCat=Calcio,Tennis,Nuoto
+|AndCat=Biografie
+|And=off
+}}
+</pre>
+Mostra voci che:
+* Sono in categoria Calcio/Tennis/Nuoto OPPURE
+* Sono in categoria Biografie
+
+==== Architettura religiosa (ampia ricerca) ====
+<pre>
+{{VociRecenti
+|num=30
+|Title=Chiesa|Cattedrale|Basilica
+|Text=gotico|romanico|barocco
+|And=on
+|Disp=o
+}}
+</pre>
+Mostra voci che hanno "Chiesa" O "Cattedrale" O "Basilica" nel titolo, E "gotico" O "romanico" O "barocco" nel contenuto.
+
+=== Esempi con AndTemplate e OrTemplate ===
+
+==== Biografie con nazionalità e attività ====
+<pre>
+{{VociRecenti
+|num=20
+|AndTemplate=Bio(Nazione;Attività)
+|Disp=v
+}}
+</pre>
+Voci con {{tl|Bio}} che abbiano sia <code>Nazione=</code> che <code>Attività=</code> valorizzati.
+
+==== Voci con infobox sportivo (calciatore O allenatore O arbitro) ====
+<pre>
+{{VociRecenti
+|num=30
+|OrTemplate=Infobox calciatore,Infobox allenatore,Infobox arbitro
+|Disp=v
+}}
+</pre>
+
+==== Voci del portale astronomia ====
+<pre>
+{{VociRecenti
+|num=20
+|Portali=astronomia
+|Disp=v
+}}
+</pre>
+
+==== Voci con più portali (AND) ====
+<pre>
+{{VociRecenti
+|num=20
+|Portali=astronomia,fisica
+|Disp=v
+}}
+</pre>
+Solo voci che hanno sia il portale astronomia che il portale fisica.
+
+==== Combinazione: biografie con portale sport ====
+<pre>
+{{VociRecenti
+|num=30
+|AndTemplate=Bio
+|Portali=sport
+|And=on
+|Disp=v
+}}
+</pre>
+Biografie che hanno anche il portale sport.
+
+=== Esempi con NoCat ===
+
+==== Biografie che non siano stub ====
+<pre>
+{{VociRecenti
+|num=20
+|TextRegExp=%{%{ *Bio
+|CaseSensitive=on
+|NoCat=stub,abbozzi
+|Disp=v
+}}
+</pre>
+Biografie che non hanno categorie contenenti "stub" o "abbozzi".
+
+==== Voci di astronomia escluse quelle sugli asteroidi ====
+<pre>
+{{VociRecenti
+|num=30
+|OrCat=astronomia,stelle,galassie
+|NoCat=asteroidi,meteoriti,comete
+|Disp=v
+}}
+</pre>
+Voci di astronomia ma non sugli oggetti del sistema solare minore.
+
+=== Esempi avanzati ===
+
+==== Combinazione complessa: Calciatori italiani famosi ====
+<pre>
+{{VociRecenti
+|num=20
+|AndCat=Calciatori,italiani
+|Text=Champions League|Mondiale|Olimpiadi
+|And=on
+|Disp=v
+}}
+</pre>
+AND: Calciatori italiani che hanno partecipato a Champions League OPPURE Mondiale OPPURE Olimpiadi.
+
+==== Ricerca ampia su letteratura ====
+<pre>
+{{VociRecenti
+|num=100
+|OrCat=Romanzi,Poesia
+|TextRegExp=Premio.*^(automobili|motocicl)
+|And=off
+}}
+</pre>
+OR: Opere letterarie O premi letterari (con esclusione dei premi automobilistici o motociclistici)
+
+==== Aeroporti O voci che menzionano "aeroporto" ====
+<pre>
+{{VociRecenti
+|num=50
+|TextRegExp=%{%{Aeroporto
+|CaseSensitive=on
+|Text=aeroporto
+|And=off
+|Disp=v
+}}
+</pre>
+Voci con template {{tl|Aeroporto}} OPPURE che contengono la parola "aeroporto" nel testo.
+
+==== Lista alfabetica per un portale, senza metadati ====
+<pre>
+{{VociRecenti
+|num=50
+|TextRegExp=Portale.*Matematica
+|Order=alpha
+|Disp=t
+|Timestamp=off
+}}
+</pre>
+Voci del portale Matematica in ordine alfabetico, visualizzazione minima senza data né aggiornamento.
+
+== Casi d'uso per And=on vs And=off ==
+
+=== Usa And=on (default) quando: ===
+* Vuoi risultati molto specifici
+* I filtri devono restringere la ricerca
+* Esempio: "Calciatori italiani che giocano in Serie A"
+
+=== Usa And=off quando: ===
+* Vuoi risultati più ampi
+* I filtri sono alternativi
+* Esempio: "Voci su sport O che menzionano Olimpiadi"
+
+== Suggerimenti utili ==
+Se il template è utilizzato per cercare le ultime voci di pertinenza di un determinato progetto/portale (che è lo scopo principale per cui è stato progettato):
+* '''Non effettuare ricerche usando solo Text''': Darebbe molto probabilmente "falsi positivi", ovvero voci non pertinenti che hanno casualmente quella parola nel testo.
+* '''Preferire le ricerche per''':
+** '''Categorie''': Più affidabili per identificare l'appartenenza a un progetto
+** '''Template specifici''': Usa <code>TextRegExp=%{%{NomeTemplate</code> con <code>CaseSensitive=on</code>
+** '''Portali''': Usa <code>TextRegExp=Portale.*Nomeportale</code> (il portale può essere in qualsiasi posizione)
+* '''Combinare più criteri in OR''': A meno che non si debba fare una restrizione, è utile combinare più ricerche usando <code>And=off</code> per catturare più voci pertinenti.
+* '''Ordinamento alfabetico''': Usa <code>Order=alpha</code> quando la lista è destinata a essere consultata come indice, combinato con <code>Timestamp=off</code> per un aspetto più pulito.
+
+== Note tecniche ==
+* La cache è aggiornata periodicamente dal bot (tipicamente ogni ora)
+* Il bot scarica il contenuto completo di ogni voce
+* Cache multipla: il sistema crea automaticamente più file (Dati1, Dati2, Dati3...) per superare il limite di 2MB MediaWiki
+* Il modulo Lua carica automaticamente tutti i file cache disponibili
+* Nessun limite al numero di voci nella cache (configurabile nel bot)
+* '''Title''', '''Text''': case-insensitive, supportano | per OR semplice
+* '''Text''': opera solo sui primi 100 caratteri della voce (deprecato per ricerche su testo libero)
+* '''TextRegExp''': cerca su stringa concatenata (categorie + template + params + preview 100 car.)
+* '''AndTemplate''', '''OrTemplate''': match parziale su nome template e nomi parametri valorizzati
+* '''Portali''': AND tra tutti i valori, unifica più template {{tl|Portale}} nella stessa voce
+* '''AndCat''', '''OrCat''', '''NoCat''': match parziale, case-insensitive
+* '''NoCat''': applicato sempre in AND, anche con <code>And=off</code>
+* '''TextRegExp''': nei gruppi <code>(...)</code> usa ''';''' come separatore OR, non <code>|</code>
+* '''Order=alpha''': l'ordinamento ignora gli accenti e i caratteri diacritici (à = a, è = e, ecc.)
+
+== Configurazione ==
+Richiede:
+# [[Modulo:VociRecenti]] (v8.4 o superiore) - Modulo Lua principale
+# Modulo:VociRecenti/Dati1, Dati2, Dati3... - Dati aggiornati da bot
+# Bot v8.5 configurato per aggiornamento incrementale
+
+== Changelog ==
+
+'''Versione 8.4''' (Marzo 2026)
+* Nuovi parametri '''AndTemplate=''', '''OrTemplate=''' per ricerca per template con parametri opzionali
+* Nuovo parametro '''Portali=''' per ricerca portale (AND, unifica più {{tl|Portale}} nella stessa voce)
+* '''TextRegExp=''' ora cerca su stringa concatenata (categorie + template + params + preview)
+* '''Text=''' parzialmente deprecato: opera solo sui primi 100 caratteri
+* Formato cache rinnovato: array posizionale compatto, template e parametri al posto del testo completo
+* Bot v8.11: parser template dal wikitesto, preview 100 caratteri
+
+'''Versione 8.3''' (Marzo 2026)
+* Nuovo parametro '''NoCat''' per escludere voci con determinate categorie (applicato sempre in AND)
+* Fix '''TextRegExp''': supporto gruppi OR con ''';''' come separatore (<code>|</code> dentro le parentesi viene intercettato da MediaWiki)
+* Espansione automatica dei gruppi <code>(a;b;c)</code> in varianti alternative nel matching regex
+
+'''Versione 8.1''' (Marzo 2026)
+* Supporto parametro '''Timestamp''' con 5 valori: <code>cachedays</code> (default), <code>on</code>, <code>days</code>, <code>date</code>, <code>off</code>
+* Calcolo giorni coperti dalla cache o dalle voci filtrate
+
+'''Versione 8.0''' (Marzo 2026)
+* Nuovo parametro '''Order''' per scegliere il criterio di ordinamento (data decrescente, data crescente, alfabetico)
+* Nuovo parametro '''Timestamp''' per mostrare o nascondere le informazioni sull'aggiornamento della cache
+* Ordinamento alfabetico insensibile agli accenti e caratteri diacritici
+
+'''Versione 7.0''' (Febbraio 2026)
+* Nuovo parametro '''And''' per scegliere logica AND/OR
+* Nuovo parametro '''CaseSensitive''' per ricerche case-sensitive
+* Supporto '''|''' in Title e Text per OR semplice tra termini
+* Caricamento automatico di file multipli (Dati1, Dati2, Dati3...)
+* Supporto cache illimitata (configurabile nel bot)
+* Documentazione estesa con esempi pratici
+
+'''Versione 6.0'''
+* Cache divisa in due file (Dati1, Dati2)
+
+'''Versione 5.0'''
+* Parametro Title aggiunto
+* Text ora cerca in tutto il contenuto
+
+'''Versione 4.0'''
+* Match parziale per AndCat e OrCat
+
+== Pagine correlate ==
+* [[Speciale:PaginePiùRecenti]]
+* [[Modulo:VociRecenti]]
+* [[Wikipedia:Bot]]
+
+== Categorie ==
+[[Categoria:Template di utilità]]

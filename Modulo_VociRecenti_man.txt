@@ -1,0 +1,214 @@
+{{Man modulo}}
+
+== Modulo:VociRecenti — Documentazione ==
+
+Il modulo legge la cache generata dal bot e restituisce una lista di voci di Wikipedia recenti, filtrate secondo i parametri passati dal template chiamante.
+
+=== Struttura della cache ===
+
+La cache è distribuita su più pagine wiki: <code>Modulo:VociRecenti/Dati1</code>, <code>Dati2</code>, ... <code>DatiN</code>.
+
+Ogni file è un modulo Lua che restituisce una tabella con questa struttura (formato compatto, array posizionale):
+
+<syntaxhighlight lang="lua">
+return {
+  u = '10/03/2026 04:15',   -- ultimo aggiornamento
+  v = '8.35',               -- versione bot
+  p = 1,                    -- numero parte
+  tp = 3,                   -- totale parti
+  n = 250,                  -- numero voci in questa parte
+  d = {
+    {
+      [[Nome della voce]],
+      [[20260310041500]],
+      { [[Categoria uno]], [[Categoria due]] },
+      { { [[NomeTemplate]], { [[param1]], [[param2]] } } },
+      [[Primi 100 caratteri del testo...]],
+    },
+    -- ...
+  }
+}
+</syntaxhighlight>
+
+I titoli e le stringhe usano long string Lua con livello di escape automatico (<code><nowiki>[[...]]</nowiki></code>, <code>[=[...]=]</code>, ecc.) per evitare problemi con caratteri speciali nel wikitesto.
+
+=== Funzioni del modulo ===
+
+==== p.main(frame) ====
+
+Funzione principale richiamata dal template. Legge i parametri, carica tutti i file cache, filtra le voci e restituisce l'output formattato.
+
+{| class="wikitable"
+! Parametro !! Tipo !! Default !! Descrizione
+|-
+| <code>num</code> || numero || 10 || Quante voci mostrare
+|-
+| <code>OrCat</code> || stringa || — || Categorie in OR (''',''' o ''';''' come separatori)
+|-
+| <code>AndCat</code> || stringa || — || Categorie in AND tra gruppi, OR dentro i gruppi (''',''' = AND, ''';''' = OR)
+|-
+| <code>NoCat</code> || stringa || — || Categorie da escludere; sempre applicato in AND (''',''' = AND tra gruppi, ''';''' = OR dentro i gruppi)
+|-
+| <code>Title</code> || stringa || — || Condizione sul titolo (''';''' = OR tra gruppi, '''+''' = AND tra termini nel gruppo)
+|-
+| <code>Text</code> || stringa || — || Parola nei primi 100 caratteri (''';''' o <code>|</code> per OR)
+|-
+| <code>TextRegExp</code> || stringa || — || Pattern regex Lua su stringa concatenata (categorie + template + params + preview)
+|-
+| <code>CaseSensitive</code> || on/off || off || Distingue maiuscole/minuscole nella regex
+|-
+| <code>DataFine</code> || gg/mm/aaaa || — || Solo voci create dopo questa data; sempre applicato in AND
+|-
+| <code>AndTemplate</code> || stringa || — || Tutti i template elencati devono essere presenti (''',''' = AND tra gruppi, ''';''' = OR dentro i gruppi)
+|-
+| <code>OrTemplate</code> || stringa || — || Almeno un template deve essere presente (''',''' e ''';''' entrambi OR)
+|-
+| <code>Portali</code> || stringa || — || Tutti i portali elencati devono essere presenti (AND, ''',''' come separatore)
+|-
+| <code>OrPortali</code> || stringa || — || Almeno un portale deve essere presente (OR, ''',''' come separatore)
+|-
+| <code>And</code> || on/off || off || Se on, i filtri si combinano in AND; default off (logica OR)
+|-
+| <code>Order</code> || data/dataold/alpha || data || Criterio di ordinamento (vedi sotto)
+|-
+| <code>Timestamp</code> || cachedays/on/days/date/off || cachedays || Informazioni di aggiornamento da mostrare (vedi sotto)
+|-
+| <code>Disp</code> || s/v/t/o || s || Formato output (vedi sotto)
+|-
+| <code>DispScroll</code> || ''modalità'',''altezza'' || — || Come Disp, ma in scrollbox verticale; ha precedenza su Disp se specificato
+|}
+
+I valori del parametro <code>Disp</code> (e del componente modalità di <code>DispScroll</code>):
+
+{| class="wikitable"
+! Valore !! Formato
+|-
+| <code>s</code> || Elenco numerato senza data
+|-
+| <code>v</code> || Elenco numerato con data
+|-
+| <code>t</code> || Elenco puntato senza data
+|-
+| <code>o</code> || Elenco puntato con data
+|}
+
+I valori del parametro <code>Order</code>:
+
+{| class="wikitable"
+! Valore !! Ordinamento
+|-
+| <code>data</code> || Data decrescente: dalla voce più recente alla più vecchia (default)
+|-
+| <code>dataold</code> || Data crescente: dalla voce più vecchia alla più recente
+|-
+| <code>alpha</code> || Alfabetico crescente per titolo (dalla A alla Z, accenti ignorati)
+|}
+
+I valori del parametro <code>Timestamp</code>:
+
+{| class="wikitable"
+! Valore !! Contenuto mostrato
+|-
+| <code>cachedays</code> || Data aggiornamento + numero file cache + giorni coperti dall'intera cache (default)
+|-
+| <code>on</code> || Data aggiornamento + numero file cache + giorni coperti dalle voci filtrate
+|-
+| <code>days</code> || Data aggiornamento + giorni coperti dalle voci filtrate (senza numero file cache)
+|-
+| <code>date</code> || Solo data aggiornamento
+|-
+| <code>off</code> || Nessuna informazione
+|}
+
+Tutti i parametri del template sono '''case-insensitive''': <code>|Disp=</code>, <code>|disp=</code> e <code>|DISP=</code> sono equivalenti.
+
+==== p.debugVoce(frame) ====
+
+Funzione di debug: dato un titolo di voce, mostra le sue categorie e verifica se corrisponde a un filtro <code>OrCat</code> specificato. Esempio di utilizzo:
+
+<syntaxhighlight lang="text">
+{{#invoke:VociRecenti|debugVoce|titolo=Nome voce|OrCat=aviatori}}
+</syntaxhighlight>
+
+=== Logica di filtraggio ===
+
+I filtri vengono applicati in sequenza su ogni voce della cache. La modalità di combinazione dipende dal parametro <code>And</code>:
+
+* '''Modalità OR''' (default, <code>And=off</code>): basta che almeno uno dei filtri sia soddisfatto.
+* '''Modalità AND''' (<code>And=on</code>): tutti i filtri specificati devono essere soddisfatti simultaneamente.
+
+I filtri <code>DataFine</code>, <code>NoCat</code> e <code>NoTemplate</code> vengono sempre applicati in AND anche in modalità OR.
+
+==== Logica dei separatori ====
+
+Diversi parametri supportano separatori multipli con significati distinti:
+
+* '''AndCat''', '''NoCat''', '''AndTemplate''': la virgola ''',''' separa gruppi in AND tra loro; il punto e virgola ''';''' separa alternative OR dentro lo stesso gruppo. Esempio: <code>AndCat=calciatori;giocatori,italiani</code> → (calciatori OR giocatori) AND (italiani).
+* '''OrCat''', '''OrTemplate''': virgola e punto e virgola sono entrambi OR.
+* '''Title''': il punto e virgola ''';''' separa gruppi in OR; il più '''+''' separa termini in AND dentro un gruppo. Esempio: <code>Title=riserva+naturale;oasi</code> → (riserva AND naturale) OR oasi.
+* '''Text''': punto e virgola ''';''' o pipe <code>|</code> (via <code><nowiki>{{!}}</nowiki></code>) come OR tra termini.
+
+=== Logica di ordinamento ===
+
+L'ordinamento viene applicato dopo il filtraggio e prima del troncamento al numero di voci richiesto (<code>num</code>). Con <code>Order=alpha</code> i caratteri accentati e diacritici vengono normalizzati alla lettera base prima del confronto (à = a, è = e, ecc.).
+
+=== Comportamento con nessuna voce trovata ===
+
+Se nessuna voce corrisponde ai criteri di filtro, il modulo mostra un messaggio di avviso. Se <code>Timestamp</code> non è <code>off</code>, viene comunque visualizzata la riga "Ultimo aggiornamento" sotto il messaggio, per poter verificare che la cache sia aggiornata.
+
+=== DispScroll ===
+
+Quando si usa <code>DispScroll</code>, il modulo genera il wikitext della sola lista, lo preelabora in HTML tramite <code>frame:preprocess()</code> (con un newline iniziale per garantire che i marcatori <code>#</code> e <code>*</code> siano riconosciuti come markup di lista anche dentro un <code>&lt;div&gt;</code>), avvolge il risultato in un div scorrevole, e aggiunge la riga del timestamp fuori dallo scrollbox.
+
+=== Stato sviluppo ===
+
+'''Versione corrente: v8.17'''
+
+{| class="wikitable"
+! Versione !! Modifica principale
+|-
+| v1–v5 || Sviluppo iniziale, singolo file cache, filtri base
+|-
+| v6.0 || Supporto multi-file cache (Dati1, Dati2, ...)
+|-
+| v7.0 || Caricamento automatico file multipli, parametro <code>And</code> per combinazione filtri OR/AND
+|-
+| v8.0 || Parametri <code>Order</code> e <code>Timestamp</code> (on/off)
+|-
+| v8.1 || Parametro <code>Timestamp</code> esteso: 5 valori (cachedays/on/days/date/off); calcolo giorni coperti
+|-
+| v8.3 || Parametro <code>NoCat</code>; fix TextRegExp con gruppi OR usando ''';''' dentro le parentesi
+|-
+| v8.4 || Parametri <code>AndTemplate</code>, <code>OrTemplate</code>, <code>Portali</code>; TextRegExp su stringa concatenata
+|-
+| v8.7 || Parametro <code>OrPortali</code> (logica OR sui portali)
+|-
+| v8.8 || Fix normalizzazione parametri: stringa vuota e <code>off</code> trattati come assenza di valore
+|-
+| v8.9 || Tutti i parametri del template ora case-insensitive
+|-
+| v8.10 || Parametro <code>DispScroll</code>: lista in scrollbox verticale
+|-
+| v8.13 || Separatore ''';''' come OR in Title, Text, AndCat, OrCat, NoCat, AndTemplate, OrTemplate
+|-
+| v8.14 || Parametro Title: '''+''' come AND tra termini dentro i gruppi OR separati da ''';'''
+|-
+| v8.15 || Parametro <code>NoTemplate</code>: esclude voci con determinati template (stessa logica di NoCat)
+|-
+| v8.16 || Default di <code>And</code> cambiato da <code>on</code> a <code>off</code>: logica OR come comportamento predefinito
+|-
+| v8.17 || Memoizzazione di <code>loadAllData()</code>: i file cache vengono caricati una sola volta per pagina; più template sulla stessa pagina riusano i dati in memoria. Limite pratico: massimo 2 template VociRecenti per pagina (con ~3000 voci: 1 template ≈ 57% RAM Lua, 2 ≈ 88%, 3 = OOM)
+|}
+
+=== Limiti di utilizzo ===
+
+Con ~3000 voci in cache, ogni template VociRecenti carica tutti i file Dati in memoria Lua. I limiti pratici sono:
+* 1 template per pagina: ~30 MB Lua (57% del budget disponibile)
+* 2 template per pagina: ~46 MB Lua (88% del budget disponibile)
+* 3 o più template per pagina: errore di memoria (OOM)
+
+'''Non superare i 3000 voci in cache''' (parametro <code>MAX_PAGES</code> nel bot) e '''non usare più di 2 template VociRecenti sulla stessa pagina'''.
+
+Il modulo usa <code>pcall</code> per proteggere il <code>require()</code> di ogni file cache: se un file ha errori di sintassi Lua, viene saltato senza bloccare l'intera esecuzione. I long string Lua nei campi della cache possono usare qualsiasi livello di escape (<code><nowiki>[[]]</nowiki></code>, <code>[=[]=]</code>, ecc.) — il modulo non deve gestirli esplicitamente perché Lua li interpreta nativamente.
+
+<!-- la pagina del modulo non si può categorizzare direttamente, va fatto da qui --><includeonly>[[Categoria:Moduli]]</includeonly><noinclude>[[Categoria:Manuali dei moduli]]</noinclude>

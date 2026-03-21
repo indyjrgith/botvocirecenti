@@ -1,0 +1,256 @@
+<includeonly>{{#invoke:VociRecenti|main}}</includeonly><noinclude>
+{{Avviso|Questo template mostra le voci più recenti create su Wikipedia}}
+
+== Descrizione ==
+Il template '''VociRecenti''' visualizza le voci più recenti create su Wikipedia italiana con possibilità di filtrare per categorie, titolo, contenuto testuale e data.
+
+'''NOVITÀ v7.0''':
+* Cache automatica multipla (supporta migliaia di voci)
+* Nuovo parametro '''And''' per scegliere la logica di ricerca (AND/OR)
+
+== Sintassi ==
+<pre>
+{{VociRecenti
+|num=
+|AndCat=
+|OrCat=
+|Title=
+|Text=
+|TextRegExp=
+|DataFine=
+|Disp=
+|And=
+}}
+</pre>
+
+== Parametri ==
+
+=== Parametri numerici ===
+* '''num''' - Numero di voci da visualizzare (default 10). Nessun limite massimo.
+
+=== Parametri di filtro per categorie ===
+* '''AndCat''' - Categorie (match parziale, case-insensitive). La voce deve essere in TUTTE le categorie elencate.
+* '''OrCat''' - Categorie (match parziale, case-insensitive). La voce deve essere in ALMENO UNA categoria elencata.
+
+=== Parametri di filtro per contenuto ===
+* '''Title''' - Il titolo deve contenere questo testo (match parziale, case-insensitive)
+* '''Text''' - Il contenuto deve contenere questo testo (ricerca su tutto il contenuto, case-insensitive)
+* '''TextRegExp''' - Espressione regolare sul contenuto
+
+=== Parametri temporali ===
+* '''DataFine''' - Data limite formato GG/MM/AAAA (mostra solo voci dopo questa data)
+
+=== Parametri di visualizzazione ===
+* '''Disp''' - Modalità visualizzazione:
+** '''s''' (standard) = Solo voce con numero d'ordine
+** '''v''' (verbose) = Numero, voce e data
+** '''o''' (only date) = Voce e data senza numero
+** '''t''' (title only) = Solo voce senza altro
+
+=== NUOVO: Parametro logica di ricerca ===
+* '''And''' - Modalità di combinazione dei filtri (default: '''on''')
+** '''And=on''' (default) = '''Logica AND''' - La voce viene visualizzata SOLO se TUTTI i filtri sono soddisfatti contemporaneamente
+** '''And=off''' = '''Logica OR''' - La voce viene visualizzata se ALMENO UNO dei filtri è soddisfatto
+
+== Differenza tra And=on e And=off ==
+
+{| class="wikitable"
+! Parametro !! Comportamento
+|-
+| '''And=on'''<br/>(default) || Tutti i filtri devono essere soddisfatti ('''AND''')<br/>Esempio: <code>AndCat=Biografie|Text=Nobel</code><br/>→ Mostra SOLO biografie che menzionano "Nobel"
+|-
+| '''And=off''' || Almeno un filtro deve essere soddisfatto ('''OR''')<br/>Esempio: <code>AndCat=Biografie|Text=Nobel</code><br/>→ Mostra biografie OPPURE voci che menzionano "Nobel"
+|}
+
+'''Nota:''' Il parametro '''DataFine''' viene sempre applicato in AND anche in modalità OR.
+
+== Esempi ==
+
+=== Esempi base ===
+
+==== Ultime 20 voci ====
+<pre>{{VociRecenti|num=20}}</pre>
+
+==== Cerca nel titolo ====
+<pre>{{VociRecenti|num=10|Title=Chiesa}}</pre>
+
+==== Cerca nel contenuto ====
+<pre>{{VociRecenti|num=10|Text=gotico}}</pre>
+
+=== Esempi con logica AND (default) ===
+
+==== Calciatori che hanno giocato in Serie A ====
+<pre>
+{{VociRecenti
+|num=20
+|AndCat=Calciatori
+|Text=Serie A
+|And=on
+|Disp=v
+}}
+</pre>
+Mostra SOLO voci che sono:
+* Categorizzate in "Calciatori" E
+* Contengono "Serie A" nel testo
+
+==== Chiese gotiche ====
+<pre>
+{{VociRecenti
+|num=15
+|Title=Chiesa
+|Text=gotico
+|And=on
+|Disp=o
+}}
+</pre>
+Mostra SOLO voci che:
+* Hanno "Chiesa" nel titolo E
+* Contengono "gotico" nel testo
+
+==== Film italiani recenti ====
+<pre>
+{{VociRecenti
+|num=30
+|AndCat=Film
+|OrCat=italiano
+|DataFine=01/01/2025
+|And=on
+}}
+</pre>
+Mostra voci che:
+* Sono in categoria "Film" E
+* Sono in categoria "italiano" (o simile) E
+* Create dopo 01/01/2025
+
+=== Esempi con logica OR ===
+
+==== Voci su premi O che menzionano "Nobel" ====
+<pre>
+{{VociRecenti
+|num=25
+|Title=Premio
+|Text=Nobel
+|And=off
+|Disp=v
+}}
+</pre>
+Mostra voci che:
+* Hanno "Premio" nel titolo OPPURE
+* Contengono "Nobel" nel testo
+
+==== Sport O biografie ====
+<pre>
+{{VociRecenti
+|num=50
+|OrCat=Calcio,Tennis,Nuoto
+|AndCat=Biografie
+|And=off
+}}
+</pre>
+Mostra voci che:
+* Sono in categoria Calcio/Tennis/Nuoto OPPURE
+* Sono in categoria Biografie
+
+==== Architettura religiosa (ampia ricerca) ====
+<pre>
+{{VociRecenti
+|num=30
+|Title=Chiesa,Cattedrale,Basilica
+|Text=gotico,romanico,barocco
+|And=off
+|Disp=o
+}}
+</pre>
+Mostra voci che hanno nel titolo una delle parole O nel contenuto uno degli stili architettonici.
+
+=== Esempi avanzati ===
+
+==== Combinazione complessa: Calciatori italiani famosi ====
+<pre>
+{{VociRecenti
+|num=20
+|AndCat=Calciatori,italiani
+|Text=Champions League,Mondiale,Olimpiadi
+|And=on
+|Disp=v
+}}
+</pre>
+AND: Calciatori italiani che hanno partecipato a competizioni importanti
+
+==== Ricerca ampia su letteratura ====
+<pre>
+{{VociRecenti
+|num=100
+|OrCat=Romanzi,Poesia,Saggistica
+|Title=Premio
+|And=off
+}}
+</pre>
+OR: Opere letterarie O premi letterari
+
+==== Solo biografie recenti con regex ====
+<pre>
+{{VociRecenti
+|num=15
+|AndCat=Biografie
+|TextRegExp=\d{4}\s*[-–]\s*\d{4}
+|DataFine=01/02/2025
+|And=on
+|Disp=v
+}}
+</pre>
+Biografie con date di vita e create dopo 01/02/2025
+
+== Casi d'uso per And=on vs And=off ==
+
+=== Usa And=on (default) quando: ===
+* Vuoi risultati molto specifici
+* I filtri devono restringere la ricerca
+* Esempio: "Calciatori italiani che giocano in Serie A"
+
+=== Usa And=off quando: ===
+* Vuoi risultati più ampi
+* I filtri sono alternativi
+* Esempio: "Voci su sport O che menzionano Olimpiadi"
+
+== Note tecniche ==
+* La cache è aggiornata periodicamente dal bot (tipicamente ogni ora)
+* Il bot scarica il contenuto completo di ogni voce
+* Cache multipla: il sistema crea automaticamente più file (Dati1, Dati2, Dati3...) per superare il limite di 2MB
+* Il modulo Lua carica automaticamente tutti i file cache disponibili
+* Nessun limite al numero di voci nella cache (configurabile nel bot)
+* Tutti i parametri di ricerca testuale sono case-insensitive
+* AndCat, OrCat, Title, Text supportano match parziale
+
+== Configurazione ==
+Richiede:
+# [[Modulo:VociRecenti]] (v7.0 o superiore) - Modulo Lua principale
+# Modulo:VociRecenti/Dati1, Dati2, Dati3... (v3.0 o superiore) - Dati aggiornati da bot
+# Bot v3.0 configurato per aggiornamento incrementale
+
+== Changelog ==
+
+'''Versione 7.0''' (Febbraio 2025)
+* ✨ Nuovo parametro '''And''' per scegliere logica AND/OR
+* ✨ Caricamento automatico di file multipli (Dati1, Dati2, Dati3...)
+* ✨ Supporto cache illimitata (configurabile nel bot)
+* 📝 Documentazione estesa con esempi AND/OR
+
+'''Versione 6.0'''
+* Cache divisa in due file (Dati1, Dati2)
+
+'''Versione 5.0'''
+* Parametro Title aggiunto
+* Text ora cerca in tutto il contenuto
+
+'''Versione 4.0'''
+* Match parziale per AndCat e OrCat
+
+== Vedi anche ==
+* [[Speciale:PaginePiùRecenti]]
+* [[Modulo:VociRecenti]]
+* [[Wikipedia:Bot]]
+
+[[Categoria:Template di utilità]]
+[[Categoria:Template che usano Modulo:VociRecenti]]
+</noinclude>

@@ -1,0 +1,204 @@
+== Bot VociRecenti — Documentazione ==
+
+Il bot mantiene una cache delle voci di Wikipedia italiana create di recente, accessibile tramite il template <code><nowiki>{{VociRecenti}}</nowiki></code>. La cache permette al modulo Lua di filtrare e visualizzare le voci per categoria, titolo, testo e data senza dover interrogare l'API di Wikipedia ad ogni visualizzazione della pagina.
+
+=== Componenti ===
+
+{| class="wikitable"
+! File !! Scopo
+|-
+| <code>bot_voci_recenti_v833.py</code> || Bot principale: raccoglie le voci e aggiorna la cache
+|-
+| <code>PuliziaCache.py</code> || Script di pulizia: rimuove voci non più valide dalla cache e aggiorna metadati
+|-
+| <code>VVCache.py</code> || Utility: conta e verifica le voci presenti nei file cache locali
+|-
+| <code>Modulo:VociRecenti</code> || Modulo Lua: legge la cache e risponde alle chiamate del template
+|-
+| <code>Modulo:VociRecenti/Dati1..N</code> || File cache: dati delle voci in formato Lua
+|-
+| <code>Utente:BotVociRecenti/CacheMoved</code> || Lista manuale di voci da aggiungere/aggiornare/rimuovere dalla cache
+|-
+| <code>Utente:BotVociRecenti/CacheParsed</code> || Flag: indica se la cache manuale è già stata processata
+|-
+| <code>cleanup_state.json</code> || File locale: tiene traccia se la pulizia è già stata eseguita nella fascia oraria
+|}
+
+=== Come funziona il bot ===
+
+Il bot viene eseguito periodicamente (tipicamente ogni ora tramite pianificatore). Ad ogni esecuzione segue questi passi:
+
+==== STEP 1 — Pulizia automatica (AutoClean) ====
+
+Il bot verifica se deve eseguire <code>PuliziaCache.py</code> in base alla variabile <code>AutoClean</code>:
+
+* <code>Once</code> ''(default)'': la pulizia viene eseguita una sola volta nella fascia oraria definita da <code>AutoCleanTimeBegin</code> e <code>AutoCleanTimeEnd</code>. Fuori fascia il flag viene resettato, così alla prossima fascia la pulizia verrà rieseguita.
+* <code>Every</code>: la pulizia viene eseguita ad ogni run.
+* <code>None</code>: la pulizia non viene mai eseguita automaticamente.
+
+==== STEP 2 — Caricamento cache esistente ====
+
+Il bot legge tutti i file <code>Modulo:VociRecenti/Dati1</code>, <code>Dati2</code>, ... e carica le voci già presenti in cache. I duplicati vengono ignorati: in caso di titolo duplicato, viene mantenuta la prima occorrenza trovata (la più recente, poiché i file sono ordinati per data decrescente). Per ogni duplicato ignorato viene stampato il titolo nel log.
+
+==== STEP 3 — Calcolo data limite ====
+
+Il bot calcola fino a che data accettare voci. Il limite è il massimo tra:
+
+* 30 giorni fa (<code>MAX_AGE_DAYS</code>)
+* la data della voce più vecchia già presente in cache
+
+Questo impedisce che la cache si espanda verso il passato ad ogni esecuzione.
+
+==== STEP 4 — Cache manuale (CacheMoved) ====
+
+Se la pagina <code>[[Utente:BotVociRecenti/CacheParsed]]</code> non contiene <code>True</code>, il bot legge <code>[[Utente:BotVociRecenti/CacheMoved]]</code>, che supporta tre tipi di comandi:
+
+* '''Titolo semplice''' o riga copiata da [[Speciale:PaginePiùRecenti]]: aggiunge o aggiorna la voce in cache (scarica categorie, template, preview aggiornati da Wikipedia; se la voce è già in cache la sostituisce).
+* '''<code>Aggiorna: Titolo voce</code>''': aggiorna esplicitamente una voce già presente in cache (forza il purge della pagina su Wikipedia prima di rileggere le categorie, per evitare dati stale dall'indice).
+* '''<code>Rimuovi: Titolo voce</code>''': rimuove una voce dalla cache.
+
+Dopo aver processato la lista, il bot scrive <code>True</code> in <code>CacheParsed</code> per evitare di riprocessarla ad ogni esecuzione. Per far rileggere la lista basta cancellare o modificare <code>CacheParsed</code>.
+
+Il formato di <code>CacheMoved</code>:
+<syntaxhighlight lang="text">
+Grimpella thaumastocheir
+16:32, 28 feb 2026 Altra voce (cron | modifica) [3 657 byte]
+Aggiorna: Nome voce da aggiornare
+Rimuovi: Nome voce da rimuovere
+</syntaxhighlight>
+
+'''Nota tecnica''': il purge prima di rileggere le categorie è necessario perché le categorie aggiunte da template (es. <code><nowiki>{{Bio|Attività=medico}}</nowiki></code>) non sono nel wikitesto grezzo ma nell'indice Wikipedia, che può essere in ritardo dopo una modifica recente.
+
+==== STEP 5 — Ricerca nuove voci da RecentChanges ====
+
+Il bot interroga l'API di Wikipedia cercando tutte le voci create in NS0 con timestamp più recente della voce più recente già in cache. La ricerca si ferma non appena incontra voci più vecchie del riferimento (non c'è un limite sul numero di voci trovate, solo un limite di sicurezza sulle chiamate API pari a <code>MAX_ITERATIONS</code>).
+
+Vengono cercate anche le voci spostate nel NS0 da altri namespace (sandbox, namespace utente, ecc.) nello stesso intervallo temporale.
+
+==== STEP 6 — Unione, deduplicazione, ordinamento e troncamento ====
+
+Tutte le voci (nuove + cache esistente + cache manuale) vengono unite. Se un titolo è presente sia nella cache caricata che tra le voci aggiornate tramite <code>Aggiorna:</code>, viene mantenuto il record aggiornato (quello con i metadati freschi). Le voci vengono quindi ordinate per data di creazione (dalla più recente alla più vecchia) e troncate al valore massimo <code>MAX_PAGES</code> (default: 3000), rimuovendo sempre le più vecchie.
+
+==== STEP 7 — Salvataggio ====
+
+Prima del salvataggio il bot valida i long string Lua nei titoli per garantire che i delimitatori di escape siano corretti. Le voci vengono poi suddivise in file da max <code>MAX_CHARS_PER_FILE</code> caratteri (default: ~1,5 MB) e salvate in <code>Modulo:VociRecenti/Dati1</code>, <code>Dati2</code>, ecc. I file in eccesso rispetto al necessario vengono svuotati automaticamente (non cancellati, per evitare errori MediaWiki).
+
+=== Script di pulizia (PuliziaCache.py) ===
+
+Eseguito automaticamente dal bot nella fascia oraria configurata (o manualmente), rimuove dalla cache le voci non più valide e aggiorna i metadati di quelle rimaste. La versione corrente è '''PC-1.3'''.
+
+==== Fasi di esecuzione ====
+
+===== FASE 1 — Rimozione duplicati =====
+
+Scorre la lista delle voci e mantiene solo la prima occorrenza di ogni titolo. I duplicati successivi vengono rimossi. Utile per riparare cache corrotte o generate in condizioni anomale.
+
+===== FASE 2 — Rimozione voci non in NS0 =====
+
+Verifica tramite API che ogni voce sia effettivamente nel namespace 0. Rimuove le voci finite per errore in namespace sbagliato (es. namespace Utente, Discussione, ecc.).
+
+===== FASE 3 — Rimozione voci cancellate, redirect e aggiornamento metadati =====
+
+Per ogni voce rimasta, interroga l'API di Wikipedia e verifica:
+
+* Se la pagina non esiste più: la voce viene '''rimossa''' dalla cache.
+* Se la pagina è diventata un redirect: la voce viene '''rimossa''' dalla cache (configurabile tramite <code>REMOVE_REDIRECTS</code>).
+* Se la pagina esiste ed è valida: confronta le categorie, i template e la preview attuali con quelli in cache. Se c'è una differenza, la voce viene '''aggiornata''' con i metadati freschi e il log riporta cosa è cambiato (categorie, template o entrambi).
+
+Questa fase è la più lenta perché richiede una chiamata API per ogni voce in cache.
+
+===== FASE 4 — Rimozione voci troppo vecchie =====
+
+Rimuove le voci con timestamp di creazione precedente a <code>MAX_AGE_DAYS</code> giorni fa. Usa il timestamp già presente in cache senza fare chiamate API aggiuntive. Se il timestamp non è valido, la voce viene mantenuta con un avviso nel log.
+
+===== FASE 5 — Riparazione Portale vuoti =====
+
+Dopo le rimozioni, scorre tutte le voci rimaste e cerca template di tipo "Portale" con parametri vuoti o assenti. Se li trova, rilancia il download completo dei metadati per quella voce e aggiorna il record in cache. Questo serve a riparare voci in cui il campo template era stato corrotto da bug precedenti.
+
+===== Salvataggio =====
+
+Al termine di tutte le fasi, la cache pulita viene salvata nei file <code>Modulo:VociRecenti/Dati1</code>, <code>Dati2</code>, ecc. I file in eccesso vengono svuotati automaticamente. Il salvataggio avviene sempre, anche se non ci sono state rimozioni (la FASE 3 potrebbe aver aggiornato metadati senza rimuovere voci).
+
+==== Parametri configurabili ====
+
+<syntaxhighlight lang="python">
+VERSION = 'PC-1.3'            # Versione dello script (incrementare ad ogni modifica)
+MAX_PAGES = 3000              # Numero massimo di voci da mantenere
+MAX_CHARS_PER_FILE = 1500000  # Dimensione massima per file cache (~1,5 MB)
+MAX_AGE_DAYS = 30             # Età massima delle voci in giorni
+REMOVE_DELETED = True         # Rimuovi voci cancellate
+REMOVE_REDIRECTS = True       # Rimuovi voci diventate redirect
+REMOVE_WRONG_NAMESPACE = True # Rimuovi voci non in NS0
+REMOVE_TOO_OLD = True         # Rimuovi voci troppo vecchie
+</syntaxhighlight>
+
+=== Modulo Lua (Modulo:VociRecenti) ===
+
+Il modulo legge automaticamente tutti i file <code>Dati1</code>, <code>Dati2</code>, ... e li unisce in memoria. Usa <code>require()</code> invece di <code>mw.loadData()</code> per gestire file di grandi dimensioni. Versione corrente: '''v8.14'''.
+
+Per la documentazione completa dei parametri del template vedere [[Template:VociRecenti/man]].
+
+=== Stato sviluppo ===
+
+'''Versione corrente: bot v8.33 / PuliziaCache PC-1.3 / Modulo Lua v8.14'''
+
+==== Cronologia versioni bot ====
+
+{| class="wikitable"
+! Versione !! Modifica principale
+|-
+| v8.0 || Separazione pulizia in script esterno (PuliziaCache.py), sistema CacheParsed, controllo duplicati in STEP 2
+|-
+| v8.1 || Filtro data creazione: scarta voci più vecchie del limite calcolato dinamicamente
+|-
+| v8.2 || Fix parser Lua: conteggio bilanciato delle graffe invece di regex fragile
+|-
+| v8.3 || Fix parser Lua: graffe dentro long string Lua non sbilanciano più il parser
+|-
+| v8.4 || Sistema AutoClean con fascia oraria configurabile e file di stato locale JSON
+|-
+| v8.5 || Fix logica RecentChanges: raccoglie tutte le voci nuove fino al timestamp di riferimento; troncamento a MAX_PAGES solo alla fine
+|-
+| v8.11 || Parser template dal wikitesto; preview 100 caratteri; formato cache array posizionale compatto
+|-
+| v8.29 || Fix STEP 6: i titoli con record aggiornato in <code>pages_to_update</code> vengono esclusi dal <code>remove_set</code>, evitando auto-cancellazione durante <code>Aggiorna:</code>
+|-
+| v8.31 || Aggiunto purge della pagina prima di rileggere le categorie in <code>Aggiorna:</code> (evita dati stale dall'indice Wikipedia); log dei titoli duplicati ignorati in STEP 2
+|-
+| v8.32 || Deduplicazione esplicita in STEP 6: se un titolo è duplicato in <code>all_pages</code>, viene mantenuto il record di <code>pages_to_update</code> (aggiornato) invece del vecchio dalla cache. Fix <code>UnboundLocalError</code> su <code>pages_to_update</code> quando <code>CacheParsed=True</code>
+|-
+| v8.33 || Ottimizzazione <code>validate_lua_longstrings</code> in STEP 7: da loop carattere per carattere a <code>re.finditer</code> + <code>str.find</code>; riduzione sensibile del tempo di esecuzione su file cache grandi
+|}
+
+==== Cronologia versioni PuliziaCache ====
+
+{| class="wikitable"
+! Versione !! Modifica principale
+|-
+| PC-1.0 || Prima versione autonoma (estratta dal bot)
+|-
+| PC-1.1 || Parser Lua robusto: ignora graffe dentro long string Lua
+|-
+| PC-1.2 || Fix formato output: parametri Portale ora serializzati correttamente (bug che causava template Portale con parametri vuoti in cache)
+|-
+| PC-1.3 || FASE 5: riparazione automatica delle voci con Portale vuoto; <code>VERSION</code> incrementata correttamente
+|}
+
+==== Problemi noti / possibili miglioramenti futuri ====
+
+* <code>get_moved_to_ns0</code> usa un limite fisso di 5000 voci nei log di spostamento.
+* Il parser Lua in Python è custom: funziona sui file generati dal bot ma potrebbe avere problemi con file modificati manualmente in modo non standard.
+* Le categorie aggiunte da template (es. <code><nowiki>{{Bio|Attività=medico}}</nowiki></code>) sono nell'indice Wikipedia, non nel wikitesto grezzo. Il purge in <code>Aggiorna:</code> mitiga il problema ma non lo elimina completamente in caso di indici molto in ritardo.
+* Se RecentChanges sarà migliorato dagli sviluppatori di MediaWiki per restituire le voci create in NS0 anche quando spostate da altri namespace, la cache manuale (<code>CacheMoved</code>) potrà essere in parte automatizzata.
+
+=== Parametri di configurazione principali (bot) ===
+
+<syntaxhighlight lang="python">
+MAX_PAGES = 3000              # Numero massimo di voci in cache
+MAX_CHARS_PER_FILE = 1500000  # Dimensione massima per file cache (~1,5 MB)
+MAX_AGE_DAYS = 30             # Età massima delle voci in giorni
+AutoClean = 'Once'            # 'Once' | 'Every' | 'None'
+AutoCleanTimeBegin = '03:00'  # Inizio fascia oraria pulizia automatica
+AutoCleanTimeEnd   = '05:00'  # Fine fascia oraria pulizia automatica
+MAX_ITERATIONS = 400          # Limite chiamate API RecentChanges (sicurezza)
+</syntaxhighlight>
