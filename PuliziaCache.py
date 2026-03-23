@@ -57,7 +57,8 @@ REMOVE_DELETED = True
 REMOVE_REDIRECTS = True
 REMOVE_WRONG_NAMESPACE = True
 REMOVE_TOO_OLD = True                      # Rimuovi voci troppo vecchie
-LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pulizia_cache.log')
+DATA_DIR = '/data/project/botvocirecenti/botvocirecenti'
+LOG_FILE = os.path.join(DATA_DIR, 'pulizia_cache.log')
 # ========================================
 
 

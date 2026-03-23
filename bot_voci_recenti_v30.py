@@ -166,15 +166,15 @@ AutoCleanTimeEnd   = '05:00'
 
 # File di stato per AutoClean = 'Once'
 # Viene creato nella stessa cartella del bot
-CLEANUP_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cleanup_state.json')
+CLEANUP_STATE_FILE = os.path.join(DATA_DIR, 'cleanup_state.json')
 
 # File di cache locale per gli spostamenti già processati
 # Evita di riverificare via API gli spostamenti rifiutati nei run precedenti
-MOVES_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'moves_cache.json')
+MOVES_CACHE_FILE = os.path.join(DATA_DIR, 'moves_cache.json')
 MOVES_CACHE_MAX_AGE_DAYS = 30  # Rimuovi entry più vecchie di N giorni
 
 # Script di pulizia (nella stessa cartella del bot)
-PULIZIA_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'PuliziaCache.py')
+PULIZIA_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'PuliziaCache.py')  # invariato
 
 # Versione minima richiesta di PuliziaCache.py
 # Il bot rifiuta di eseguire PuliziaCache se la versione presente è inferiore
@@ -182,7 +182,7 @@ REQUIRED_PULIZIA_VERSION = 'PC-2.0'
 
 # File di log (nella stessa cartella del bot)
 # L'output viene scritto sia a video che nel file di log
-LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bot_voci_recenti.log')
+LOG_FILE = os.path.join(DATA_DIR, 'bot_voci_recenti.log')
 LOG_MAX_BYTES = 2 * 1024 * 1024  # 2 MB: se superato, viene troncato tenendo la parte finale
 
 # Controllo voci cancellate/redirect ad ogni run del bot
