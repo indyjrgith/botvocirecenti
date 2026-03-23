@@ -6,7 +6,7 @@
 #   ./avvia_bot_toolforge.sh 12m          -> ogni ora, al minuto (attuale+12)%60
 #   ./avvia_bot_toolforge.sh 0h12m        -> ogni ora, al minuto 12
 #   ./avvia_bot_toolforge.sh 2h15m        -> ogni 2 ore, al minuto 15
-#   ./avvia_bot_toolforge.sh stop         -> ferma il job schedulato
+#   ./avvia_bot_toolforge.sh stop         -> ferma il bot in modo sicuro (attende fine scrittura cache)
 #   ./avvia_bot_toolforge.sh logs         -> monitora i log in tempo reale
 
 # ============================================================
@@ -16,6 +16,10 @@ BOT_SCRIPT="bot_voci_recenti_v30.py"
 BOT_IMAGE="tool-botvocirecenti/tool-botvocirecenti:latest"
 JOB_NAME="botvocirecenti"
 JOB_NAME_ONEOFF="bot-oneoff"
+CACHE_PAGE="Modulo:VociRecenti/Dati1"
+WIKI_API="https://it.wikipedia.org/w/api.php"
+SAFE_STOP_THRESHOLD=300   # secondi: se Dati1 è stato modificato meno di 5 minuti fa, il bot sta scrivendo
+SAFE_STOP_POLL=30         # secondi: intervallo di controllo
 # ============================================================
 
 # Colori
@@ -125,16 +129,74 @@ show_logs() {
 }
 
 # ------------------------------------------------------------
-# Funzione: ferma il job schedulato
+# Funzione: attende che il bot abbia finito di scrivere la cache
+# Controlla il timestamp dell'ultima modifica di Dati1 su Wikipedia
+# ------------------------------------------------------------
+wait_for_safe_stop() {
+    echo -e "${CYAN}Controllo stato scrittura cache...${NC}"
+    echo -e "  Pagina monitorata: ${YELLOW}${CACHE_PAGE}${NC}"
+
+    while true; do
+        # Recupera il timestamp dell'ultima modifica di Dati1 (in UTC ISO 8601)
+        local api_response
+        api_response=$(curl -s "${WIKI_API}?action=query&titles=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${CACHE_PAGE}'))")&prop=revisions&rvprop=timestamp&format=json" 2>/dev/null)
+
+        local last_edit
+        last_edit=$(echo "$api_response" | grep -o '"timestamp":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+        if [ -z "$last_edit" ]; then
+            echo -e "  ${YELLOW}Impossibile recuperare il timestamp da Wikipedia, procedo con lo stop.${NC}"
+            break
+        fi
+
+        # Converti il timestamp Wikipedia (UTC) in secondi Unix
+        local ts_wiki
+        ts_wiki=$(date -u -d "$last_edit" +%s 2>/dev/null)
+        if [ -z "$ts_wiki" ]; then
+            # Fallback per sistemi che non supportano -d
+            ts_wiki=$(python3 -c "from datetime import datetime; print(int(datetime.strptime('${last_edit}', '%Y-%m-%dT%H:%M:%SZ').timestamp()))" 2>/dev/null)
+        fi
+
+        local ts_now
+        ts_now=$(date -u +%s)
+
+        local diff=$(( ts_now - ts_wiki ))
+
+        if [ "$diff" -lt "$SAFE_STOP_THRESHOLD" ]; then
+            echo -e "  ${YELLOW}Bot probabilmente in scrittura cache (ultima modifica: ${diff}s fa). Attendo ${SAFE_STOP_POLL}s...${NC}"
+            sleep "$SAFE_STOP_POLL"
+        else
+            echo -e "  ${GREEN}Cache ferma da ${diff}s — sicuro procedere con lo stop.${NC}"
+            break
+        fi
+    done
+}
+
+# ------------------------------------------------------------
+# Funzione: ferma il bot in modo sicuro
 # ------------------------------------------------------------
 stop_schedule() {
     echo -e "${CYAN}Arresto job schedulato '${JOB_NAME}'...${NC}"
+
+    # Attendi che il bot finisca di scrivere la cache
+    wait_for_safe_stop
+
+    # Elimina il job schedulato
     if toolforge jobs show "$JOB_NAME" &>/dev/null; then
         toolforge jobs delete "$JOB_NAME"
-        echo -e "${GREEN}Job '${JOB_NAME}' eliminato.${NC}"
+        echo -e "${GREEN}Job schedulato '${JOB_NAME}' eliminato.${NC}"
     else
         echo -e "${YELLOW}Nessun job schedulato '${JOB_NAME}' trovato.${NC}"
     fi
+
+    # Elimina anche eventuale job one-off in esecuzione
+    if toolforge jobs show "$JOB_NAME_ONEOFF" &>/dev/null; then
+        echo -e "${CYAN}Trovato job one-off '${JOB_NAME_ONEOFF}' in esecuzione, eliminazione...${NC}"
+        toolforge jobs delete "$JOB_NAME_ONEOFF"
+        echo -e "${GREEN}Job one-off '${JOB_NAME_ONEOFF}' eliminato.${NC}"
+    fi
+
+    echo -e "${GREEN}Bot fermato.${NC}"
 }
 
 # ------------------------------------------------------------
