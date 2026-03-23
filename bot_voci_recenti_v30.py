@@ -173,11 +173,17 @@ AutoCleanTimeBegin = '02:00'
 AutoCleanTimeEnd   = '05:00'
 
 # File di stato per AutoClean = 'Once'
-# Percorso dinamico: home del tool su Toolforge, cartella script altrove
-if os.path.exists('/data/project'):
-    DATA_DIR = os.path.expanduser('~')
+# Percorso dinamico: su Toolforge usa /data/project/<tool>/<tool>, altrove cartella script
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+if os.path.exists('/data/project') and '/data/project/' in _script_dir:
+    DATA_DIR = _script_dir
+elif os.path.exists('/data/project'):
+    # Toolforge ma script in /workspace/: usa la home del tool che contiene i file dati
+    _home = os.path.expanduser('~')
+    _tool_name = os.path.basename(_home)
+    DATA_DIR = os.path.join(_home, _tool_name)
 else:
-    DATA_DIR = os.path.dirname(os.path.abspath(__file__))
+    DATA_DIR = _script_dir
 CLEANUP_STATE_FILE = os.path.join(DATA_DIR, 'cleanup_state.json')
 
 # File di cache locale per gli spostamenti già processati
