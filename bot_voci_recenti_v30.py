@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v8.35
+Bot VociRecenti v8.37
 
 Changelog:
+- v8.37: Compatibilità multipiattaforma (Toolforge/Termux/Windows):
+         DATA_DIR dinamico: usa home del tool su Toolforge, cartella script altrove.
+         time.tzset() protetto con try/except per compatibilità Windows.
+         Rimosso import os duplicato.
 - v8.36: FIX check_deleted_pages: rimosso redirects=True dalla query API batch.
          Con redirects=True MediaWiki seguiva i redirect restituendo la pagina
          di destinazione, nascondendo il flag 'redirect' e impedendo la rimozione
@@ -132,10 +136,14 @@ import os
 import subprocess
 import sys
 import logging
-import os
+
+# Fuso orario italiano (funziona su Linux/Termux, ignorato su Windows)
 os.environ['TZ'] = 'Europe/Rome'
-import time
-time.tzset()
+try:
+    import time
+    time.tzset()
+except AttributeError:
+    pass  # Windows non supporta tzset()
 
 # ========================================
 # CONFIGURAZIONE
@@ -165,8 +173,11 @@ AutoCleanTimeBegin = '02:00'
 AutoCleanTimeEnd   = '05:00'
 
 # File di stato per AutoClean = 'Once'
-# Viene creato nella stessa cartella del bot
-DATA_DIR = '/data/project/botvocirecenti/botvocirecenti'
+# Percorso dinamico: home del tool su Toolforge, cartella script altrove
+if os.path.exists('/data/project'):
+    DATA_DIR = os.path.expanduser('~')
+else:
+    DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 CLEANUP_STATE_FILE = os.path.join(DATA_DIR, 'cleanup_state.json')
 
 # File di cache locale per gli spostamenti già processati
