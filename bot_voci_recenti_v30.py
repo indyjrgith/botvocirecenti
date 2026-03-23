@@ -166,6 +166,7 @@ AutoCleanTimeEnd   = '05:00'
 
 # File di stato per AutoClean = 'Once'
 # Viene creato nella stessa cartella del bot
+DATA_DIR = '/data/project/botvocirecenti/botvocirecenti'
 CLEANUP_STATE_FILE = os.path.join(DATA_DIR, 'cleanup_state.json')
 
 # File di cache locale per gli spostamenti già processati
