@@ -1,5 +1,7 @@
 # Manuale: Esecuzione automatica di un bot Python su Android con Termux
 
+Versione aggiornata per BotVociRecenti **v8.37**
+
 ## Panoramica
 
 Questa guida descrive come configurare uno smartphone Android con Termux per eseguire automaticamente un bot Python a cadenze regolari, con monitoraggio dell'output in tempo reale tramite tmux.
@@ -34,7 +36,7 @@ Aprire Termux e installare i pacchetti necessari:
 
 ```bash
 pkg update && pkg upgrade
-pkg install python cronie tmux
+pkg install python cronie tmux git
 ```
 
 ### 1.3 Dipendenze Python
@@ -52,7 +54,7 @@ pip install pywikibot
 Creare una cartella dedicata al bot. Il percorso consigliato è nella cartella Download di Android, accessibile da Termux tramite:
 
 ```
-~/storage/downloads/nomebot/
+~/storage/downloads/botvocirecenti/
 ```
 
 Per abilitare l'accesso allo storage:
@@ -64,12 +66,15 @@ termux-setup-storage
 La struttura attesa è:
 
 ```
-~/storage/downloads/nomebot/
-├── bot.py              # Script principale del bot
-├── user-config.py      # Configurazione pywikibot
-├── user-password.py    # Credenziali pywikibot
-├── bot.log             # Log di esecuzione (creato automaticamente)
-└── avviabot_run.sh     # Wrapper per cron (copiato automaticamente da avviabot)
+~/storage/downloads/botvocirecenti/
+├── bot_voci_recenti_v30.py   # Script principale del bot
+├── PuliziaCache.py            # Script pulizia cache
+├── user-config.py             # Configurazione pywikibot
+├── user-password.py           # Credenziali pywikibot
+├── moves_cache.json           # Cache spostamenti (aggiornata automaticamente)
+├── cleanup_state.json         # Stato pulizia giornaliera
+├── bot_voci_recenti.log       # Log di esecuzione (creato automaticamente)
+└── avviabot_run.sh            # Wrapper per cron (copiato automaticamente da avviabot)
 ```
 
 Gli script di gestione vanno in `~/bin/` per essere disponibili da qualsiasi directory:
@@ -82,16 +87,40 @@ Gli script di gestione vanno in `~/bin/` per essere disponibili da qualsiasi dir
 
 ---
 
-## 3. Script di gestione
+## 3. Configurazione credenziali pywikibot
 
-### 3.1 Script launcher: `avviabot`
+### user-config.py
+
+```python
+# -*- coding: utf-8 -*-
+family = 'wikipedia'
+mylang = 'it'
+usernames['wikipedia']['it'] = 'BotVociRecenti'
+put_throttle = 1
+maxlag = 5
+console_encoding = 'utf-8'
+```
+
+### user-password.py
+
+```python
+('BotVociRecenti', BotPassword('BotVociRecenti', 'la_tua_password_bot'))
+```
+
+> **Nota:** la password bot si ottiene da Wikipedia → Speciale:Password bot.
+
+---
+
+## 4. Script di gestione
+
+### 4.1 Script launcher: `avviabot`
 
 Salvare come `~/bin/avviabot` e renderlo eseguibile con `chmod +x ~/bin/avviabot`.
 
 Adattare le variabili nella sezione CONFIGURAZIONE:
 - `BOT_DIR`: percorso della cartella del bot
 - `BOT_SCRIPT`: nome del file Python del bot
-- `PYTHONPATH`: percorso site-packages Python (ottenibile con `python3 -c "import site; print(site.getsitepackages())"`)
+- `PYTHONPATH_VAL`: ottenibile con `python3 -c "import site; print(site.getsitepackages())"`
 
 ```bash
 #!/data/data/com.termux/files/usr/bin/bash
@@ -105,13 +134,13 @@ Adattare le variabili nella sezione CONFIGURAZIONE:
 # ============================================================
 # CONFIGURAZIONE — adattare a proprio ambiente
 # ============================================================
-BOT_DIR="$HOME/storage/downloads/nomebot"
-BOT_SCRIPT="bot.py"
+BOT_DIR="$HOME/storage/downloads/botvocirecenti"
+BOT_SCRIPT="bot_voci_recenti_v30.py"
 PYTHON_BIN="/data/data/com.termux/files/usr/bin/python3"
-PYTHONPATH_VAL="/data/data/com.termux/files/usr/lib/pythonX.XX/site-packages"
+PYTHONPATH_VAL="/data/data/com.termux/files/usr/lib/python3.13/site-packages"
 BOT_CMD="$PYTHON_BIN $BOT_DIR/$BOT_SCRIPT"
 WRAPPER_SCRIPT="$BOT_DIR/avviabot_run.sh"
-CRON_TAG="# miobot"
+CRON_TAG="# botvocirecenti"
 # ============================================================
 
 RED='\033[0;31m'
@@ -123,16 +152,17 @@ NC='\033[0m'
 launch_bot() {
     echo -e "${CYAN}Avvio bot...${NC}"
     if command -v tmux &>/dev/null; then
-        if tmux has-session -t miobot 2>/dev/null; then
-            tmux new-window -t miobot -n "bot-$(date +%H%M)" \
-                "$BOT_CMD; echo ''; echo '[Bot terminato - premi Invio]'; read"
+        if tmux has-session -t botvoci 2>/dev/null; then
+            tmux new-window -t botvoci -n "bot-$(date +%H%M)" \
+                "$BOT_CMD; echo ''; echo '[Bot terminato - premi Invio]'; read; exit"
         else
-            tmux new-session -d -s miobot -n "bot" \
-                "$BOT_CMD; echo ''; echo '[Bot terminato - premi Invio]'; read"
+            tmux new-session -d -s botvoci -n "bot" \
+                "$BOT_CMD; echo ''; echo '[Bot terminato - premi Invio]'; read; exit"
         fi
-        echo -e "${GREEN}Bot avviato in sessione tmux 'miobot'${NC}"
+        echo -e "${GREEN}Bot avviato in sessione tmux 'botvoci'${NC}"
+        echo -e "  Per visualizzare: ${YELLOW}tmux attach -t botvoci${NC}"
         if [ -t 1 ]; then
-            tmux attach -t miobot
+            tmux attach -t botvoci
         fi
     else
         echo -e "${YELLOW}tmux non trovato — esecuzione diretta.${NC}"
@@ -154,8 +184,7 @@ install_crontab() {
     echo -e "  Espressione cron: ${YELLOW}${cron_expr}${NC}"
 
     if ! pgrep -x crond &>/dev/null; then
-        crond 2>/dev/null
-        sleep 1
+        crond 2>/dev/null; sleep 1
         if ! pgrep -x crond &>/dev/null; then
             echo -e "${RED}ERRORE: crond non avviabile. Installa con: pkg install cronie${NC}"
             exit 1
@@ -163,7 +192,6 @@ install_crontab() {
     fi
     echo -e "${GREEN}crond in esecuzione.${NC}"
 
-    # Copia wrapper nella dir del bot
     if [ -f "$HOME/bin/avviabot_run" ]; then
         cp "$HOME/bin/avviabot_run" "$WRAPPER_SCRIPT"
     fi
@@ -192,8 +220,7 @@ install_crontab() {
 
 parse_param() {
     local param="$1"
-    PARSED_MIN=-1
-    PARSED_HOURS=1
+    PARSED_MIN=-1; PARSED_HOURS=1
     if [[ "$param" =~ ^([0-9]+)h([0-9]+)m$ ]]; then
         PARSED_HOURS="${BASH_REMATCH[1]}"
         PARSED_MIN="${BASH_REMATCH[2]}"
@@ -202,12 +229,10 @@ parse_param() {
     fi
     if [[ "$param" =~ ^([0-9]+)m$ ]]; then
         local offset="${BASH_REMATCH[1]}"
-        local now_min
-        now_min=$(date +%M | sed 's/^0*//')
+        local now_min; now_min=$(date +%M | sed 's/^0*//')
         [ -z "$now_min" ] && now_min=0
         PARSED_MIN=$(( (now_min + offset) % 60 ))
-        PARSED_HOURS=1
-        return 0
+        PARSED_HOURS=1; return 0
     fi
     echo -e "${RED}ERRORE: formato non valido. Esempi: 2m | 0h15m | 2h30m${NC}"
     exit 1
@@ -219,19 +244,16 @@ if [ ! -f "$BOT_DIR/$BOT_SCRIPT" ]; then
 fi
 
 if [ $# -eq 0 ]; then
-    echo -e "${CYAN}=== Bot ===${NC}"
+    echo -e "${CYAN}=== Bot VociRecenti ===${NC}"
     echo -n "Lancia il bot ora? [s/N] "
     read -r risposta
-    case "$risposta" in
-        [sS]|[yY]) launch_bot ;;
-        *) echo "Annullato."; exit 0 ;;
-    esac
+    case "$risposta" in [sS]|[yY]) launch_bot ;; *) echo "Annullato."; exit 0 ;; esac
     exit 0
 fi
 
 parse_param "$1"
 echo -e "${CYAN}=== Configurazione crontab ===${NC}"
-echo -e "  Parametro: ${YELLOW}$1${NC} -> minuto ${PARSED_MIN}, ogni ${PARSED_HOURS}h"
+echo -e "  Parametro: ${YELLOW}$1${NC} → minuto ${PARSED_MIN}, ogni ${PARSED_HOURS}h"
 echo -n "Confermi? [s/N] "
 read -r risposta
 case "$risposta" in
@@ -240,25 +262,21 @@ case "$risposta" in
 esac
 ```
 
-### 3.2 Script wrapper cron: `avviabot_run`
+### 4.2 Script wrapper cron: `avviabot_run`
 
 Salvare come `~/bin/avviabot_run` e renderlo eseguibile con `chmod +x ~/bin/avviabot_run`.
-
-Adattare `BOT_DIR`, `BOT_SCRIPT` e `PYTHON_BIN` come nello script launcher.
 
 ```bash
 #!/data/data/com.termux/files/usr/bin/bash
 # avviabot_run - Wrapper eseguito da cron
-# Avvia il bot in tmux e porta Termux in foreground
 
-BOT_DIR="$HOME/storage/downloads/nomebot"
-BOT_SCRIPT="bot.py"
+BOT_DIR="$HOME/storage/downloads/botvocirecenti"
+BOT_SCRIPT="bot_voci_recenti_v30.py"
 PYTHON_BIN="/data/data/com.termux/files/usr/bin/python3"
 BOT_CMD="$PYTHON_BIN $BOT_DIR/$BOT_SCRIPT"
-TMUX_SESSION="miobot"
+TMUX_SESSION="botvoci"
 WIN_NAME="bot-$(date +%H%M)"
 
-# Crea sessione tmux se non esiste, altrimenti apre nuova finestra
 if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
     tmux new-window -t "$TMUX_SESSION" -n "$WIN_NAME" \
         "$BOT_CMD; echo ''; echo '=== Bot terminato - premi Invio ==='; read"
@@ -268,14 +286,13 @@ else
         "$BOT_CMD; echo ''; echo '=== Bot terminato - premi Invio ==='; read"
 fi
 
-# Porta Termux in foreground
 sleep 1
 am start --user 0 -n com.termux/.app.TermuxActivity \
     --es com.termux.app.EXTRA_ARGUMENTS "tmux attach -t $TMUX_SESSION" \
     > /dev/null 2>&1
 ```
 
-### 3.3 Script di avvio automatico: `~/.termux/boot/start-services.sh`
+### 4.3 Script di avvio automatico: `~/.termux/boot/start-services.sh`
 
 Questo script viene eseguito da Termux:Boot ad ogni riavvio del telefono.
 
@@ -285,15 +302,15 @@ Questo script viene eseguito da Termux:Boot ad ogni riavvio del telefono.
 sv up crond
 # Mantiene il wakelock (evita che Android sospenda Termux)
 termux-wake-lock
-# Pre-crea la sessione tmux così è pronta prima della prima scadenza cron
-tmux new-session -d -s miobot 2>/dev/null
+# Pre-crea la sessione tmux
+tmux new-session -d -s botvoci 2>/dev/null
 ```
 
 ---
 
-## 4. Configurazione PATH
+## 5. Configurazione PATH
 
-Per poter lanciare `avviabot` da qualsiasi directory, `~/bin` deve essere nel PATH. Aggiungere al file `$PREFIX/etc/bash.bashrc`:
+Per poter lanciare `avviabot` da qualsiasi directory, `~/bin` deve essere nel PATH:
 
 ```bash
 echo 'export PATH="$HOME/bin:$PATH"' >> $PREFIX/etc/bash.bashrc
@@ -301,17 +318,17 @@ echo 'export PATH="$HOME/bin:$PATH"' >> $PREFIX/etc/bash.bashrc
 
 ---
 
-## 5. Auto-attach tmux all'apertura di Termux
+## 6. Auto-attach tmux all'apertura di Termux
 
-Per fare in modo che Termux mostri automaticamente l'output del bot quando viene aperto (se il bot è in esecuzione), aggiungere al file `$PREFIX/etc/bash.bashrc`:
+Per mostrare automaticamente l'output del bot quando Termux viene aperto:
 
 ```bash
-echo '[[ -z "$TMUX" ]] && tmux has-session -t miobot 2>/dev/null && tmux attach -t miobot' >> $PREFIX/etc/bash.bashrc
+echo '[[ -z "$TMUX" ]] && tmux has-session -t botvoci 2>/dev/null && tmux attach -t botvoci' >> $PREFIX/etc/bash.bashrc
 ```
 
 ---
 
-## 6. Installazione passo-passo
+## 7. Installazione passo-passo
 
 ```bash
 # 1. Abilitare accesso storage
@@ -319,47 +336,62 @@ termux-setup-storage
 
 # 2. Installare pacchetti
 pkg update && pkg upgrade
-pkg install python cronie tmux
+pkg install python cronie tmux git
 
 # 3. Installare pywikibot
 pip install pywikibot
 
-# 4. Creare cartella bot e copiare i file del bot
-mkdir -p ~/storage/downloads/nomebot
-# copiare qui bot.py, user-config.py, user-password.py
+# 4. Ottenere il codice dal repository GitHub
+cd ~/storage/downloads
+git clone https://github.com/indyjrgith/botvocirecenti.git botvocirecenti
 
-# 5. Creare cartella bin e copiare gli script
+# 5. Creare user-config.py e user-password.py (vedi sezione 3)
+
+# 6. Creare cartella bin e copiare gli script
 mkdir -p ~/bin
-# copiare avviabot e avviabot_run in ~/bin
+# copiare avviabot e avviabot_run in ~/bin (vedi sezione 4)
 chmod +x ~/bin/avviabot ~/bin/avviabot_run
 
-# 6. Aggiungere ~/bin al PATH
+# 7. Aggiungere ~/bin al PATH
 echo 'export PATH="$HOME/bin:$PATH"' >> $PREFIX/etc/bash.bashrc
 source $PREFIX/etc/bash.bashrc
 
-# 7. Configurare auto-attach tmux
-echo '[[ -z "$TMUX" ]] && tmux has-session -t miobot 2>/dev/null && tmux attach -t miobot' >> $PREFIX/etc/bash.bashrc
+# 8. Configurare auto-attach tmux
+echo '[[ -z "$TMUX" ]] && tmux has-session -t botvoci 2>/dev/null && tmux attach -t botvoci' >> $PREFIX/etc/bash.bashrc
 
-# 8. Creare script di boot
+# 9. Creare script di boot
 mkdir -p ~/.termux/boot
 cat > ~/.termux/boot/start-services.sh << 'EOF'
 #!/data/data/com.termux/files/usr/bin/sh
 sv up crond
 termux-wake-lock
-tmux new-session -d -s miobot 2>/dev/null
+tmux new-session -d -s botvoci 2>/dev/null
 EOF
 chmod +x ~/.termux/boot/start-services.sh
 
-# 9. Avviare crond manualmente (prima del riavvio)
+# 10. Avviare crond manualmente (prima del riavvio)
 crond
 
-# 10. Configurare e installare il crontab
+# 11. Configurare e installare il crontab
 avviabot 5m        # avvia ogni ora, a partire da 5 minuti da adesso
 ```
 
 ---
 
-## 7. Utilizzo di avviabot
+## 8. Aggiornamento del codice
+
+Per aggiornare il bot all'ultima versione dal repository GitHub:
+
+```bash
+cd ~/storage/downloads/botvocirecenti
+git pull origin main
+```
+
+> **Nota:** i file `user-config.py` e `user-password.py` non sono nel repository e non vengono sovrascritti dall'aggiornamento.
+
+---
+
+## 9. Utilizzo di avviabot
 
 | Comando | Effetto |
 |---|---|
@@ -370,7 +402,7 @@ avviabot 5m        # avvia ogni ora, a partire da 5 minuti da adesso
 
 ---
 
-## 8. Monitoraggio
+## 10. Monitoraggio
 
 ### Vedere l'output in tempo reale
 
@@ -379,7 +411,7 @@ All'apertura di Termux, se il bot è in esecuzione la sessione tmux viene mostra
 In alternativa:
 
 ```bash
-tmux attach -t miobot
+tmux attach -t botvoci
 ```
 
 ### Navigazione in tmux
@@ -394,12 +426,12 @@ tmux attach -t miobot
 ### Consultare il log
 
 ```bash
-tail -f ~/storage/downloads/nomebot/bot.log
+tail -f ~/storage/downloads/botvocirecenti/bot_voci_recenti.log
 ```
 
 ---
 
-## 9. Comandi di diagnostica
+## 11. Comandi di diagnostica
 
 ```bash
 # Verifica se crond è attivo
@@ -416,15 +448,18 @@ crontab -l
 
 # Riavvia crond manualmente
 crond
+
+# Verifica file persistenti della cache
+ls -la ~/storage/downloads/botvocirecenti/*.json
 ```
 
 ---
 
-## 10. Interruzione e manutenzione
+## 12. Interruzione e manutenzione
 
 ```bash
 # Fermare il bot in esecuzione
-pkill -f bot.py
+pkill -f bot_voci_recenti_v30.py
 
 # Rimuovere il crontab (stop schedulazione)
 crontab -r
@@ -435,15 +470,15 @@ crontab -e
 
 ---
 
-## 11. Risoluzione problemi comuni
+## 13. Risoluzione problemi comuni
 
 ### Il bot non parte da cron
 
-**Sintomo:** `bot.log` contiene `ModuleNotFoundError: No module named 'pywikibot'`
+**Sintomo:** `bot_voci_recenti.log` contiene `ModuleNotFoundError: No module named 'pywikibot'`
 
 **Causa:** cron usa un ambiente minimale senza le variabili della shell interattiva.
 
-**Soluzione:** verificare che `PYTHONPATH` nello script `avviabot` punti alla directory corretta:
+**Soluzione:** verificare che `PYTHONPATH_VAL` nello script `avviabot` punti alla directory corretta:
 ```bash
 python3 -c "import site; print(site.getsitepackages())"
 ```
@@ -484,3 +519,41 @@ Assicurarsi che il file sia eseguibile:
 ```bash
 chmod +x ~/.termux/boot/start-services.sh
 ```
+
+---
+
+### Il bot parte da zero ogni ora (moves_cache non aggiornato)
+
+**Causa:** `moves_cache.json` viene scritto nella cartella dello script, che deve essere la stessa del bot.
+
+**Verifica:**
+```bash
+ls -la ~/storage/downloads/botvocirecenti/*.json
+```
+
+I file `moves_cache.json` e `cleanup_state.json` devono esistere e avere la data dell'ultima esecuzione.
+
+---
+
+### La pulizia cache avviene più volte per notte
+
+**Causa:** `cleanup_state.json` non viene trovato o non viene aggiornato.
+
+**Verifica:**
+```bash
+cat ~/storage/downloads/botvocirecenti/cleanup_state.json
+```
+
+Deve contenere `"cleaned_today": true` dopo l'esecuzione nella fascia notturna (02:00-05:00).
+
+---
+
+## 14. Note sulla versione 8.37
+
+La v8.37 introduce la **compatibilità multipiattaforma**:
+
+- **Fuso orario:** `time.tzset()` è protetto con `try/except` per compatibilità Windows (su Termux e Linux funziona normalmente)
+- **Percorso file:** `DATA_DIR` viene determinato automaticamente dalla variabile d'ambiente `BOT_DATA_DIR` se presente (Toolforge), altrimenti usa la cartella dello script (Termux/Windows)
+- Su Termux non è necessario impostare `BOT_DATA_DIR` — il bot usa automaticamente la cartella del codice
+
+Il bot è quindi compatibile con Termux, Windows e Toolforge senza modifiche al codice.
