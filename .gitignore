@@ -38,3 +38,10 @@ bot_voci_recenti_v835.py
 
 bot_voci_recenti_v30.old (2).py
 bot_voci_recenti_v828.rev2sorgente
+
+analisi_cronologia.py
+analisi_tag.py
+cachevocispostate.py
+debug_voci_spostate.py
+diagnosi_voci_mancanti.py
+bot_voci_recenti_v836.py
