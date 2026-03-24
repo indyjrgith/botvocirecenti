@@ -1,1 +1,2 @@
 pywikibot
+requests_oauthlib
