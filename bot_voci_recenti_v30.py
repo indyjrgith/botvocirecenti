@@ -1060,6 +1060,8 @@ def validate_ns_or_manual_page(title, existing_titles, cutoff_date, moves_cache=
             if cached and cached.get('result') == 'rejected':
                 if cached.get('reason') != 'too_old':
                     return None, 'cached_rejected'
+                else:
+                    print(f"    RIVALUTATA (era too_old in cache, nuovo spostamento in NS0): {ns0_title}")
 
         def _mc_update(key, result, reason):
             if moves_cache is not None:
@@ -1626,6 +1628,8 @@ def download_page_data(titles, existing_titles, cutoff_date, moves_cache=None, m
             if cached and cached.get('result') == 'rejected' and not has_new_move:
                 skipped_cached += 1
                 continue
+            elif cached and cached.get('result') == 'rejected' and has_new_move:
+                print(f"    RIVALUTATA (era too_old in cache, nuovo spostamento in NS0): {title}")
 
         try:
             page = pywikibot.Page(site, title)
