@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v8.37
+Bot VociRecenti v8.38
 
 Changelog:
+- v8.38: FIX moves_cache: voci spostate in bozza e poi di nuovo in NS0 non
+         venivano accettate perché il titolo NS0 era già in moves_cache con
+         result='rejected' reason='too_old' dal primo ciclo di vita.
+         download_page_data: non skippa dalla cache se la voce ha un
+         move_timestamp recente nel dict corrente (nuovo spostamento in NS0).
+         validate_ns_or_manual_page: non skippa dalla cache le voci con
+         reason='too_old', permettendo rivalutazione al nuovo spostamento.
 - v8.37: Compatibilità multipiattaforma (Toolforge/Termux/Windows):
          DATA_DIR dinamico: usa home del tool su Toolforge, cartella script altrove.
          time.tzset() protetto con try/except per compatibilità Windows.
@@ -154,7 +161,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '8.37'
+VERSION = '8.38'
 MAX_AGE_DAYS = 30       
 config.put_throttle = 1
 config.minthrottle = 0
@@ -1043,11 +1050,16 @@ def validate_ns_or_manual_page(title, existing_titles, cutoff_date, moves_cache=
         if ns0_title in existing_titles:
             return None, 'duplicate'
 
-        # Skip da moves_cache: solo voci NS0 rifiutate in precedenza
+        # Skip da moves_cache: solo voci NS0 rifiutate in precedenza.
+        # Eccezione: non skippare le voci rifiutate per 'too_old' — una voce
+        # potrebbe essere stata spostata in bozza e poi di nuovo in NS0 dopo
+        # mesi. In quel caso il nuovo spostamento la porta qui con data recente
+        # e deve essere rivalutata, non bloccata dalla cache precedente.
         if moves_cache is not None:
             cached = moves_cache.get(ns0_title)
             if cached and cached.get('result') == 'rejected':
-                return None, 'cached_rejected'
+                if cached.get('reason') != 'too_old':
+                    return None, 'cached_rejected'
 
         def _mc_update(key, result, reason):
             if moves_cache is not None:
@@ -1604,10 +1616,14 @@ def download_page_data(titles, existing_titles, cutoff_date, moves_cache=None, m
             skipped_duplicate += 1
             continue
 
-        # Skip da moves_cache: solo voci rifiutate in precedenza
+        # Skip da moves_cache: solo voci rifiutate in precedenza.
+        # Eccezione: se la voce arriva con un move_timestamp recente (nuovo
+        # spostamento in NS0), ignora la cache e rivaluta — potrebbe essere
+        # una voce spostata in bozza e poi di nuovo in NS0 dopo mesi.
         if moves_cache is not None:
             cached = moves_cache.get(title)
-            if cached and cached.get('result') == 'rejected':
+            has_new_move = move_timestamps and title in move_timestamps
+            if cached and cached.get('result') == 'rejected' and not has_new_move:
                 skipped_cached += 1
                 continue
 
