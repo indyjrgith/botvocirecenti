@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v8.38
+Bot VociRecenti v8.39
 
 Changelog:
+- v8.39: FIX messaggio log RIVALUTATA in validate_ns_or_manual_page (STEP 5):
+         il messaggio diceva "nuovo spostamento in NS0" anche per voci rivalutate
+         senza un reale spostamento recente (es. voci too_old entrate in cache
+         per bug precedenti). Il messaggio corretto ora distingue i due casi:
+         STEP 4b (download_page_data): "nuovo spostamento in NS0" — corretto,
+         perché scatta solo quando move_timestamps contiene il titolo.
+         STEP 5 (validate_ns_or_manual_page): "nessuno spostamento verificato -
+         rivalutazione periodica" — corretto, perché non c'è verifica reale.
 - v8.38: FIX moves_cache: voci spostate in bozza e poi di nuovo in NS0 non
          venivano accettate perché il titolo NS0 era già in moves_cache con
          result='rejected' reason='too_old' dal primo ciclo di vita.
@@ -161,7 +169,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '8.38'
+VERSION = '8.39'
 MAX_AGE_DAYS = 30       
 config.put_throttle = 1
 config.minthrottle = 0
@@ -1061,7 +1069,7 @@ def validate_ns_or_manual_page(title, existing_titles, cutoff_date, moves_cache=
                 if cached.get('reason') != 'too_old':
                     return None, 'cached_rejected'
                 else:
-                    print(f"    RIVALUTATA (era too_old in cache, nuovo spostamento in NS0): {ns0_title}")
+                    print(f"    RIVALUTATA (era too_old in cache, nessuno spostamento verificato - rivalutazione periodica): {ns0_title}")
 
         def _mc_update(key, result, reason):
             if moves_cache is not None:
