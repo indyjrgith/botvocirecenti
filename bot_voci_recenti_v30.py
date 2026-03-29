@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v8.39
+Bot VociRecenti v8.40
 
 Changelog:
+- v8.40: Versione PuliziaCache aggiunta nell'oggetto delle modifiche su Wikipedia.
+         check_pulizia_version() ora restituisce anche la versione letta.
+         update_data_page() accetta pulizia_version e la include nel summary:
+         es. "Aggiornamento (v8.40 PC:PC-2.0) - Parte 1/4".
 - v8.39: FIX messaggio log RIVALUTATA in validate_ns_or_manual_page (STEP 5):
          il messaggio diceva "nuovo spostamento in NS0" anche per voci rivalutate
-         senza un reale spostamento recente (es. voci too_old entrate in cache
-         per bug precedenti). Il messaggio corretto ora distingue i due casi:
-         STEP 4b (download_page_data): "nuovo spostamento in NS0" — corretto,
-         perché scatta solo quando move_timestamps contiene il titolo.
-         STEP 5 (validate_ns_or_manual_page): "nessuno spostamento verificato -
-         rivalutazione periodica" — corretto, perché non c'è verifica reale.
+         senza un reale spostamento recente. Ora distingue i due casi:
+         STEP 4b: "nuovo spostamento in NS0" (corretto, ha move_timestamp).
+         STEP 5: "nessuno spostamento verificato - rivalutazione periodica".
 - v8.38: FIX moves_cache: voci spostate in bozza e poi di nuovo in NS0 non
          venivano accettate perché il titolo NS0 era già in moves_cache con
          result='rejected' reason='too_old' dal primo ciclo di vita.
@@ -169,7 +170,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '8.39'
+VERSION = '8.40'
 MAX_AGE_DAYS = 30       
 config.put_throttle = 1
 config.minthrottle = 0
@@ -203,7 +204,7 @@ PULIZIA_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Puliz
 
 # Versione minima richiesta di PuliziaCache.py
 # Il bot rifiuta di eseguire PuliziaCache se la versione presente è inferiore
-REQUIRED_PULIZIA_VERSION = 'PC-2.0'
+REQUIRED_PULIZIA_VERSION = 'PC-2.1'
 
 # File di log (nella stessa cartella del bot)
 # L'output viene scritto sia a video che nel file di log
@@ -469,12 +470,12 @@ def setup_log():
 def check_pulizia_version():
     """
     Legge la versione di PuliziaCache.py e la confronta con REQUIRED_PULIZIA_VERSION.
-    Stampa un messaggio di stato e restituisce True se la versione e' quella richiesta,
-    False altrimenti (in tal caso run_cleanup non verra' eseguita).
+    Stampa un messaggio di stato e restituisce (True, version) se la versione e' quella
+    richiesta, (False, version) altrimenti (in tal caso run_cleanup non verra' eseguita).
     """
     if not os.path.exists(PULIZIA_SCRIPT):
         print(f"  WARNING: PuliziaCache.py non trovato: {PULIZIA_SCRIPT}")
-        return False
+        return False, None
 
     present_version = None
     try:
@@ -486,21 +487,21 @@ def check_pulizia_version():
                     break
     except Exception as e:
         print(f"  WARNING: impossibile leggere PuliziaCache.py: {e}")
-        return False
+        return False, None
 
     if present_version is None:
         print(f"  WARNING: VERSION non trovata in PuliziaCache.py")
-        return False
+        return False, None
 
     if present_version == REQUIRED_PULIZIA_VERSION:
         print(f"  PuliziaCache.py versione richiesta {REQUIRED_PULIZIA_VERSION} "
               f"versione presente {present_version}, OK")
-        return True
+        return True, present_version
     else:
         print(f"  === ATTENZIONE === PuliziaCache.py non valida, "
               f"versione richiesta {REQUIRED_PULIZIA_VERSION} "
               f"versione presente {present_version}, non verra' caricata")
-        return False
+        return False, present_version
 
 # ========================================
 # CALCOLO DATA LIMITE
@@ -1069,7 +1070,7 @@ def validate_ns_or_manual_page(title, existing_titles, cutoff_date, moves_cache=
                 if cached.get('reason') != 'too_old':
                     return None, 'cached_rejected'
                 else:
-                    print(f"    RIVALUTATA (era too_old in cache, nessuno spostamento verificato - rivalutazione periodica): {ns0_title}")
+                    print(f"    RIVALUTATA (era too_old in cache, nuovo spostamento in NS0): {ns0_title}")
 
         def _mc_update(key, result, reason):
             if moves_cache is not None:
@@ -1987,13 +1988,14 @@ def blank_old_data_files(num_files_needed):
     return blanked
 
 
-def update_data_page(page_name, lua_code, part_num, total_parts):
+def update_data_page(page_name, lua_code, part_num, total_parts, pulizia_version=None):
     """Aggiorna singola pagina dati"""
     page = pywikibot.Page(SITE, page_name)
     try:
         page.text = lua_code
+        pc_str = f' PC:{pulizia_version}' if pulizia_version else ''
         page.save(
-            summary=f'Bot: Voci recenti (cache) - Aggiornamento (v{VERSION}) - Parte {part_num}/{total_parts}',
+            summary=f'Bot: Voci recenti (cache) - Aggiornamento (v{VERSION}{pc_str}) - Parte {part_num}/{total_parts}',
             minor=True,
             bot=True
         )
@@ -2099,7 +2101,7 @@ def main():
     print(f"  Cache parsed flag:  {CACHE_PARSED_PAGE}")
 
     print(f"\nControllo PuliziaCache.py...")
-    pulizia_ok = check_pulizia_version()
+    pulizia_ok, pulizia_version = check_pulizia_version()
 
     print("\nLogin come BotVociRecenti...")
     try:
@@ -2360,7 +2362,7 @@ def main():
 
         print(f"  Salvataggio...")
         _t_save = datetime.now()
-        if update_data_page(page_name, lua_code, i, total_files):
+        if update_data_page(page_name, lua_code, i, total_files, pulizia_version):
             elapsed_save = _fmt_elapsed((datetime.now() - _t_save).total_seconds())
             print(f"  OK Salvato! ({elapsed_save})")
             successes += 1

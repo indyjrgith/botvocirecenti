@@ -4,6 +4,9 @@ PuliziaCache.py - Script di pulizia cache VociRecenti
 Versione PC-2.0
 
 Changelog:
+- PC-2.1: Versione aggiunta nell'oggetto delle modifiche su Wikipedia:
+          "Bot: Pulizia cache - Rimozione duplicati/errori/vecchie (PC-2.1)"
+          "Bot: Pulizia cache - File obsoleto (PC-2.1)"
 - PC-2.0: remove_deleted_pages ottimizzata con query API batch (50 titoli/chiamata,
           senza redirects=True). Fase 1: verifica batch cancellate/redirect/NS errato.
           Fase 2: aggiornamento metadati solo per le voci sopravvissute. Drastica
@@ -46,7 +49,7 @@ from datetime import datetime, timedelta
 # ========================================
 # CONFIGURAZIONE
 # ========================================
-VERSION = 'PC-2.0'
+VERSION = 'PC-2.1'
 MAX_PAGES = 3000
 MAX_CHARS_PER_FILE = 1500000
 DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
@@ -982,7 +985,7 @@ def save_cache(pages, original_files):
 
         page = pywikibot.Page(SITE, page_name)
         page.text = lua_content
-        page.save(summary="Bot: Pulizia cache - Rimozione duplicati/errori/vecchie", minor=False)
+        page.save(summary=f"Bot: Pulizia cache - Rimozione duplicati/errori/vecchie ({VERSION})", minor=False)
         print(f"  OK Salvato")
 
     empty_lua = (
@@ -996,7 +999,7 @@ def save_cache(pages, original_files):
             if page.exists():
                 print(f"\n  Svuotamento {page_name} (obsoleto)...")
                 page.text = empty_lua
-                page.save(summary="Bot: Pulizia cache - File obsoleto", minor=True)
+                page.save(summary=f"Bot: Pulizia cache - File obsoleto ({VERSION})", minor=True)
                 print(f"  OK Svuotato")
             else:
                 break
