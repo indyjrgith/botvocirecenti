@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
 PuliziaCache.py - Script di pulizia cache VociRecenti
-Versione PC-2.0
+Versione PC-2.2
 
 Changelog:
+- PC-2.2: format_lua_data: aggiunto flag '-- tz=IT' nell'intestazione dei file
+          Lua generati e aggiornata dicitura da 'UTC' a 'ora italiana', in linea
+          con il bot v8.38 che scrive i timestamp in ora italiana (CET/CEST).
+          Senza questo fix la PuliziaCache avrebbe riscritto i file senza il flag,
+          riattivando inutilmente la migrazione one-shot al run successivo del bot.
 - PC-2.1: Versione aggiunta nell'oggetto delle modifiche su Wikipedia:
           "Bot: Pulizia cache - Rimozione duplicati/errori/vecchie (PC-2.1)"
           "Bot: Pulizia cache - File obsoleto (PC-2.1)"
@@ -49,7 +54,7 @@ from datetime import datetime, timedelta
 # ========================================
 # CONFIGURAZIONE
 # ========================================
-VERSION = 'PC-2.1'
+VERSION = 'PC-2.2'
 MAX_PAGES = 3000
 MAX_CHARS_PER_FILE = 1500000
 DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
@@ -924,8 +929,9 @@ def format_lua_data(pages_data, part_number, total_parts):
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     lines.append("-- Dati automatici per Modulo:VociRecenti")
     lines.append(f"-- PARTE {part_number} di {total_parts}")
-    lines.append(f"-- Aggiornato: {now_str} UTC")
-    lines.append(f"-- VERSIONE {VERSION}\n")
+    lines.append(f"-- Aggiornato: {now_str} ora italiana")
+    lines.append(f"-- VERSIONE {VERSION}")
+    lines.append("-- tz=IT\n")
     lines.append("return {")
     lines.append(f"  u={lua_str(datetime.now().strftime('%d/%m/%Y %H:%M'))},")
     lines.append(f"  v={lua_str(VERSION)},")

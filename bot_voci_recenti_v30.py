@@ -1,8 +1,20 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v8.40
+Bot VociRecenti v8.41
 
 Changelog:
+- v8.41: Timestamp in ora italiana (CET/CEST) invece di UTC.
+         Aggiunta funzione ts_utc_to_it() che converte pywikibot.Timestamp
+         (UTC-aware) in stringa YYYYMMDDHHMMSS secondo il fuso Europe/Rome,
+         gestendo automaticamente ora solare (+1) e ora legale (+2).
+         Aggiunta migrate_ts_utc_to_it() per la migrazione one-shot dei
+         timestamp gia' presenti in cache: in load_existing_cache_from_all_files,
+         se un file Lua non ha il flag '-- tz=IT' in testa, tutti i suoi
+         timestamp vengono convertiti UTC->IT prima di essere caricati in
+         memoria. Il flag viene scritto da format_lua_data ad ogni salvataggio.
+         Dopo il primo run post-aggiornamento tutti i file saranno IT e
+         la migrazione non avverra' piu'.
+         Modulo Lua: rimuovere il suffisso ' UTC' da formatTimestamp (v8.31).
 - v8.40: Versione PuliziaCache aggiunta nell'oggetto delle modifiche su Wikipedia.
          check_pulizia_version() ora restituisce anche la versione letta.
          update_data_page() accetta pulizia_version e la include nel summary:
@@ -152,6 +164,10 @@ import os
 import subprocess
 import sys
 import logging
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo  # Python 3.8 fallback
 
 # Fuso orario italiano (funziona su Linux/Termux, ignorato su Windows)
 os.environ['TZ'] = 'Europe/Rome'
@@ -160,6 +176,30 @@ try:
     time.tzset()
 except AttributeError:
     pass  # Windows non supporta tzset()
+
+TZ_IT = ZoneInfo('Europe/Rome')
+
+def ts_utc_to_it(ts):
+    """
+    Converte un pywikibot.Timestamp (o qualsiasi datetime UTC-aware)
+    in stringa YYYYMMDDHHMMSS secondo il fuso orario italiano (CET/CEST).
+    Gestisce automaticamente ora solare (+1) e ora legale (+2).
+    """
+    return ts.astimezone(TZ_IT).strftime('%Y%m%d%H%M%S')
+
+
+def migrate_ts_utc_to_it(ts_str):
+    """
+    Converte una stringa YYYYMMDDHHMMSS interpretata come UTC
+    nel corrispondente orario italiano (CET/CEST).
+    Usata nella migrazione one-shot dei timestamp gia' in cache.
+    """
+    try:
+        from datetime import timezone
+        dt_utc = datetime.strptime(ts_str, '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
+        return dt_utc.astimezone(TZ_IT).strftime('%Y%m%d%H%M%S')
+    except Exception:
+        return ts_str  # in caso di errore lascia invariato
 
 # ========================================
 # CONFIGURAZIONE
@@ -170,7 +210,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '8.40'
+VERSION = '8.41'
 MAX_AGE_DAYS = 30       
 config.put_throttle = 1
 config.minthrottle = 0
@@ -204,7 +244,7 @@ PULIZIA_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Puliz
 
 # Versione minima richiesta di PuliziaCache.py
 # Il bot rifiuta di eseguire PuliziaCache se la versione presente è inferiore
-REQUIRED_PULIZIA_VERSION = 'PC-2.1'
+REQUIRED_PULIZIA_VERSION = 'PC-2.2'
 
 # File di log (nella stessa cartella del bot)
 # L'output viene scritto sia a video che nel file di log
@@ -899,7 +939,12 @@ def parse_single_voce(block):
 
 
 def load_existing_cache_from_all_files():
-    """Carica cache da TUTTI i file esistenti, ignorando duplicati"""
+    """Carica cache da TUTTI i file esistenti, ignorando duplicati.
+    Migrazione one-shot: se un file non ha il flag '-- tz=IT' in testa,
+    i timestamp vengono convertiti da UTC a ora italiana prima di essere
+    inseriti in memoria. Il flag viene scritto dal bot al salvataggio,
+    quindi dopo il primo run post-aggiornamento tutti i file saranno IT.
+    """
     print("Caricamento cache esistente da tutti i file...")
 
     existing_pages = []
@@ -918,11 +963,27 @@ def load_existing_cache_from_all_files():
             page = pywikibot.Page(SITE, page_name)
             print(f"  Lettura {page_name}...")
             content = page.text
+
+            # Migrazione one-shot: controlla se il file e' gia' in ora italiana
+            needs_migration = '-- tz=IT' not in content[:500]
+            if needs_migration:
+                print(f"    Migrazione timestamp UTC->IT per {page_name}...")
+
             voci = parse_lua_to_json(content)
 
+            migrated = 0
             added = 0
             duplicates = []
             for voce in voci:
+                if needs_migration:
+                    ts = voce.get('timestamp', '')
+                    if ts and len(ts) == 14:
+                        voce['timestamp'] = migrate_ts_utc_to_it(ts)
+                        migrated += 1
+                    mt = voce.get('move_timestamp', '')
+                    if mt and len(mt) == 14:
+                        voce['move_timestamp'] = migrate_ts_utc_to_it(mt)
+
                 if voce['titolo'] not in existing_titles:
                     existing_pages.append(voce)
                     existing_titles.add(voce['titolo'])
@@ -931,6 +992,8 @@ def load_existing_cache_from_all_files():
                     duplicates.append(voce['titolo'])
 
             msg = f"    OK {added} voci caricate"
+            if needs_migration and migrated:
+                msg += f" ({migrated} timestamp migrati UTC->IT)"
             if duplicates:
                 msg += f" ({len(duplicates)} duplicate ignorate)"
             print(msg)
@@ -1095,7 +1158,7 @@ def validate_ns_or_manual_page(title, existing_titles, cutoff_date, moves_cache=
             _mc_update(ns0_title, 'rejected', 'too_old')
             return None, f'old ({created.strftime("%d/%m/%Y")})'
 
-        timestamp = created.strftime('%Y%m%d%H%M%S')
+        timestamp = ts_utc_to_it(created)
 
         categories = []
         try:
@@ -1253,7 +1316,7 @@ def read_cache_moved(existing_titles, cutoff_date, cached_pages_by_title=None):
                     # Voce non in cache: aggiungila come nuova
                     try:
                         oldest = page_obj.oldest_revision
-                        timestamp = oldest.timestamp.strftime('%Y%m%d%H%M%S')
+                        timestamp = ts_utc_to_it(oldest.timestamp)
                     except Exception:
                         timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
                     record = {
@@ -1479,7 +1542,7 @@ def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
                 break
 
             # Timestamp dello spostamento (usato come riferimento eta')
-            move_ts_str = log_ts.strftime('%Y%m%d%H%M%S')
+            move_ts_str = ts_utc_to_it(log_ts)
 
             try:
                 params = log.data.get('params', log.data)
@@ -1659,7 +1722,7 @@ def download_page_data(titles, existing_titles, cutoff_date, moves_cache=None, m
             try:
                 oldest = page.oldest_revision
                 created = oldest.timestamp
-                timestamp = created.strftime('%Y%m%d%H%M%S')
+                timestamp = ts_utc_to_it(created)
             except Exception as e:
                 skipped_error.append((title, f"timestamp: {e}"))
                 continue
@@ -1923,8 +1986,9 @@ def format_lua_data(pages_data, part_number, total_parts):
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     lines.append("-- Dati automatici per Modulo:VociRecenti")
     lines.append(f"-- PARTE {part_number} di {total_parts}")
-    lines.append(f"-- Aggiornato: {now_str} UTC")
-    lines.append(f"-- VERSIONE {VERSION}\n")
+    lines.append(f"-- Aggiornato: {now_str} ora italiana")
+    lines.append(f"-- VERSIONE {VERSION}")
+    lines.append("-- tz=IT\n")
     lines.append("return {")
     lines.append(f"  u={lua_str(datetime.now().strftime('%d/%m/%Y %H:%M'))},")
     lines.append(f"  v={lua_str(VERSION)},")
