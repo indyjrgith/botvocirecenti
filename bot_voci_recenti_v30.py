@@ -3,22 +3,23 @@
 Bot VociRecenti v8.42
 
 Changelog:
-- v8.42: FIX timestamp UTC nei confronti interni: datetime.now() su Toolforge
-         (Linux, sistema in UTC) restituisce UTC anche con os.environ['TZ']
-         impostato, perché datetime.now() senza argomenti ignora TZ in Python 3.
-         Aggiunta funzione now_it() che usa datetime.now(timezone.utc).astimezone()
-         per ottenere il datetime corrente già nel fuso Europe/Rome.
+- v8.42: FIX timestamp IT: su Toolforge ts_utc_to_it() restituiva UTC perche'
+         ZoneInfo('Europe/Rome').astimezone() non funzionava (database timezone
+         assente o non accessibile). Rimossa totalmente la dipendenza da
+         ZoneInfo/backports.zoneinfo/pytz. Introdotto algoritmo DST europeo
+         puro (_last_sunday, _it_offset_for_utc): calcola offset CET(+1)/CEST(+2)
+         direttamente senza librerie esterne. ts_utc_to_it usa replace(tzinfo=None)
+         + timedelta(hours=offset); same per migrate_ts_utc_to_it e now_it.
          Sostituito datetime.now() con now_it() in tutti i punti che producono
-         stringhe YYYYMMDDHHMMSS confrontate con timestamp delle voci (IT):
-           - compute_cutoff_date: cutoff_30
-           - STEP 6: cutoff_30 / cutoff_30_str
-           - load_moves_cache: cutoff scadenza entry
-           - download_page_data: now_str
-           - get_moved_to_ns0_since_cutoff: now_str
-           - validate_ns_or_manual_page: now_str
-         I confronti rc_ts vs cutoff_str in get_new_creations_since_cutoff e
-         scan_other_namespaces rimangono invariati: rc_ts viene dall'API in UTC
-         e cutoff_date.strftime() è coerente (entrambi naive, stesso fuso).
+         stringhe YYYYMMDDHHMMSS da confrontare con timestamp delle voci (IT):
+           - compute_cutoff_date, STEP 6 cutoff_30_str, load_moves_cache,
+             download_page_data, get_moved_to_ns0_since_cutoff,
+             validate_ns_or_manual_page, read_cache_moved (fallback),
+             format_lua_data (header u= e commento Aggiornato:).
+         FIX migrazione one-shot: i file v8.41 avevano gia' '-- tz=IT' ma
+         timestamp UTC, bloccando la migrazione al run successivo. Il flag
+         e' ora versionato '-- tz=IT-v8.42': i file v8.41 (solo '-- tz=IT')
+         vengono riconosciuti come da migrare e convertiti al primo run v8.42.
 - v8.41: Timestamp in ora italiana (CET/CEST) invece di UTC.
          Aggiunta funzione ts_utc_to_it() che converte pywikibot.Timestamp
          (UTC-aware) in stringa YYYYMMDDHHMMSS secondo il fuso Europe/Rome,
@@ -180,38 +181,45 @@ import os
 import subprocess
 import sys
 import logging
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:
-    from backports.zoneinfo import ZoneInfo  # Python 3.8 fallback
+import calendar as _calendar
 
-# Fuso orario italiano (funziona su Linux/Termux, ignorato su Windows)
-os.environ['TZ'] = 'Europe/Rome'
-try:
-    import time
-    time.tzset()
-except AttributeError:
-    pass  # Windows non supporta tzset()
+# ========================================
+# FUSO ORARIO ITALIANO - implementazione robusta senza dipendenze esterne
+# Non usa ZoneInfo ne pytz: calcola offset CET/CEST con l'algoritmo DST europeo
+# (ultima domenica di marzo ore 01:00 UTC -> +2, ultima domenica di ottobre
+# ore 01:00 UTC -> +1). Funziona su qualsiasi sistema Linux/Windows/Toolforge.
+# ========================================
 
-TZ_IT = ZoneInfo('Europe/Rome')
+def _last_sunday(year, month):
+    """Restituisce il giorno (int) dell'ultima domenica del mese dato."""
+    last_day = _calendar.monthrange(year, month)[1]
+    last_weekday = datetime(year, month, last_day).weekday()  # 0=lun, 6=dom
+    return last_day - (last_weekday - 6) % 7
 
-def now_it():
+
+def _it_offset_for_utc(dt_utc_naive):
     """
-    Restituisce datetime.now() nel fuso orario italiano (CET/CEST).
-    Sostituisce datetime.now() ovunque si producano stringhe YYYYMMDDHHMMSS
-    da confrontare con i timestamp delle voci (anch'essi in ora IT).
+    Restituisce l'offset italiano in ore (+1 CET, +2 CEST) per un datetime
+    UTC naive. Regola DST europea:
+      inizio ora legale: ultima domenica di marzo alle 01:00 UTC
+      fine ora legale:   ultima domenica di ottobre alle 01:00 UTC
     """
-    from datetime import timezone
-    return datetime.now(timezone.utc).astimezone(TZ_IT).replace(tzinfo=None)
+    y = dt_utc_naive.year
+    dst_start = datetime(y, 3,  _last_sunday(y, 3),  1, 0, 0)
+    dst_end   = datetime(y, 10, _last_sunday(y, 10), 1, 0, 0)
+    return 2 if dst_start <= dt_utc_naive < dst_end else 1
 
 
 def ts_utc_to_it(ts):
     """
-    Converte un pywikibot.Timestamp (o qualsiasi datetime UTC-aware)
-    in stringa YYYYMMDDHHMMSS secondo il fuso orario italiano (CET/CEST).
-    Gestisce automaticamente ora solare (+1) e ora legale (+2).
+    Converte un pywikibot.Timestamp (o qualsiasi datetime, aware o naive)
+    in stringa YYYYMMDDHHMMSS in ora italiana (CET/CEST).
+    Se ts e' aware l'offset UTC viene rimosso prima del calcolo DST.
+    Se ts e' naive viene trattato come UTC (comportamento di pywikibot).
+    Non dipende da ZoneInfo ne pytz.
     """
-    return ts.astimezone(TZ_IT).strftime('%Y%m%d%H%M%S')
+    dt = ts.replace(tzinfo=None)  # normalizza a naive-UTC
+    return (dt + timedelta(hours=_it_offset_for_utc(dt))).strftime('%Y%m%d%H%M%S')
 
 
 def migrate_ts_utc_to_it(ts_str):
@@ -221,11 +229,21 @@ def migrate_ts_utc_to_it(ts_str):
     Usata nella migrazione one-shot dei timestamp gia' in cache.
     """
     try:
-        from datetime import timezone
-        dt_utc = datetime.strptime(ts_str, '%Y%m%d%H%M%S').replace(tzinfo=timezone.utc)
-        return dt_utc.astimezone(TZ_IT).strftime('%Y%m%d%H%M%S')
+        dt = datetime.strptime(ts_str, '%Y%m%d%H%M%S')
+        return (dt + timedelta(hours=_it_offset_for_utc(dt))).strftime('%Y%m%d%H%M%S')
     except Exception:
-        return ts_str  # in caso di errore lascia invariato
+        return ts_str
+
+
+def now_it():
+    """
+    Restituisce il datetime corrente in ora italiana (CET/CEST) come oggetto
+    naive pronto per strftime e confronti con timestamp delle voci.
+    Non dipende da ZoneInfo ne pytz.
+    """
+    from datetime import timezone as _tz
+    utc_now = datetime.now(_tz.utc).replace(tzinfo=None)
+    return utc_now + timedelta(hours=_it_offset_for_utc(utc_now))
 
 # ========================================
 # CONFIGURAZIONE
@@ -966,10 +984,13 @@ def parse_single_voce(block):
 
 def load_existing_cache_from_all_files():
     """Carica cache da TUTTI i file esistenti, ignorando duplicati.
-    Migrazione one-shot: se un file non ha il flag '-- tz=IT' in testa,
+    Migrazione one-shot: se un file non ha il flag '-- tz=IT-v8.42' in testa,
     i timestamp vengono convertiti da UTC a ora italiana prima di essere
-    inseriti in memoria. Il flag viene scritto dal bot al salvataggio,
-    quindi dopo il primo run post-aggiornamento tutti i file saranno IT.
+    inseriti in memoria. I file scritti dalla v8.41 hanno '-- tz=IT' (senza
+    suffisso versione) ma timestamp UTC: vengono migrati a IT al primo run.
+    Il flag versionato viene scritto dal bot al salvataggio, quindi dopo il
+    primo run v8.42 tutti i file avranno '-- tz=IT-v8.42' e la migrazione
+    non avverra' piu'.
     """
     print("Caricamento cache esistente da tutti i file...")
 
@@ -990,8 +1011,12 @@ def load_existing_cache_from_all_files():
             print(f"  Lettura {page_name}...")
             content = page.text
 
-            # Migrazione one-shot: controlla se il file e' gia' in ora italiana
-            needs_migration = '-- tz=IT' not in content[:500]
+            # Migrazione one-shot: controlla se il file e' gia' stato scritto
+            # con la conversione UTC->IT corretta (flag versionato tz=IT-v8.42).
+            # I file scritti dalla v8.41 hanno '-- tz=IT' ma timestamp UTC
+            # (ts_utc_to_it non funzionava su Toolforge): vengono riconosciuti
+            # come da migrare perche' mancano del suffisso -v8.42.
+            needs_migration = '-- tz=IT-v8.42' not in content[:500]
             if needs_migration:
                 print(f"    Migrazione timestamp UTC->IT per {page_name}...")
 
@@ -2014,7 +2039,7 @@ def format_lua_data(pages_data, part_number, total_parts):
     lines.append(f"-- PARTE {part_number} di {total_parts}")
     lines.append(f"-- Aggiornato: {now_str} ora italiana")
     lines.append(f"-- VERSIONE {VERSION}")
-    lines.append("-- tz=IT\n")
+    lines.append("-- tz=IT-v8.42\n")
     lines.append("return {")
     lines.append(f"  u={lua_str(now_it().strftime('%d/%m/%Y %H:%M'))},")
     lines.append(f"  v={lua_str(VERSION)},")
