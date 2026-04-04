@@ -1,8 +1,24 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v8.41
+Bot VociRecenti v8.42
 
 Changelog:
+- v8.42: FIX timestamp UTC nei confronti interni: datetime.now() su Toolforge
+         (Linux, sistema in UTC) restituisce UTC anche con os.environ['TZ']
+         impostato, perché datetime.now() senza argomenti ignora TZ in Python 3.
+         Aggiunta funzione now_it() che usa datetime.now(timezone.utc).astimezone()
+         per ottenere il datetime corrente già nel fuso Europe/Rome.
+         Sostituito datetime.now() con now_it() in tutti i punti che producono
+         stringhe YYYYMMDDHHMMSS confrontate con timestamp delle voci (IT):
+           - compute_cutoff_date: cutoff_30
+           - STEP 6: cutoff_30 / cutoff_30_str
+           - load_moves_cache: cutoff scadenza entry
+           - download_page_data: now_str
+           - get_moved_to_ns0_since_cutoff: now_str
+           - validate_ns_or_manual_page: now_str
+         I confronti rc_ts vs cutoff_str in get_new_creations_since_cutoff e
+         scan_other_namespaces rimangono invariati: rc_ts viene dall'API in UTC
+         e cutoff_date.strftime() è coerente (entrambi naive, stesso fuso).
 - v8.41: Timestamp in ora italiana (CET/CEST) invece di UTC.
          Aggiunta funzione ts_utc_to_it() che converte pywikibot.Timestamp
          (UTC-aware) in stringa YYYYMMDDHHMMSS secondo il fuso Europe/Rome,
@@ -179,6 +195,16 @@ except AttributeError:
 
 TZ_IT = ZoneInfo('Europe/Rome')
 
+def now_it():
+    """
+    Restituisce datetime.now() nel fuso orario italiano (CET/CEST).
+    Sostituisce datetime.now() ovunque si producano stringhe YYYYMMDDHHMMSS
+    da confrontare con i timestamp delle voci (anch'essi in ora IT).
+    """
+    from datetime import timezone
+    return datetime.now(timezone.utc).astimezone(TZ_IT).replace(tzinfo=None)
+
+
 def ts_utc_to_it(ts):
     """
     Converte un pywikibot.Timestamp (o qualsiasi datetime UTC-aware)
@@ -210,7 +236,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '8.41'
+VERSION = '8.42'
 MAX_AGE_DAYS = 30       
 config.put_throttle = 1
 config.minthrottle = 0
@@ -337,7 +363,7 @@ def load_moves_cache():
             cache = {}
 
     # Rimuovi entry troppo vecchie
-    cutoff = (datetime.now() - timedelta(days=MOVES_CACHE_MAX_AGE_DAYS)).strftime('%Y%m%d%H%M%S')
+    cutoff = (now_it() - timedelta(days=MOVES_CACHE_MAX_AGE_DAYS)).strftime('%Y%m%d%H%M%S')
     before = len(cache)
     cache = {t: v for t, v in cache.items() if v.get('processed_at', '0') >= cutoff}
     removed = before - len(cache)
@@ -554,7 +580,7 @@ def compute_cutoff_date(cached_pages):
     - 30 giorni fa (MAX_AGE_DAYS)
     - timestamp della voce piu' VECCHIA gia' in cache
     """
-    cutoff_30 = datetime.now() - timedelta(days=MAX_AGE_DAYS)
+    cutoff_30 = now_it() - timedelta(days=MAX_AGE_DAYS)
 
     if not cached_pages:
         print(f"  Limite data: {cutoff_30.strftime('%d/%m/%Y')} (30 giorni fa, cache vuota)")
@@ -1104,7 +1130,7 @@ def validate_ns_or_manual_page(title, existing_titles, cutoff_date, moves_cache=
     per i checkpoint periodici del moves_cache.
     Restituisce il dict voce se valida, None altrimenti (con motivo).
     """
-    now_str = datetime.now().strftime('%Y%m%d%H%M%S')
+    now_str = now_it().strftime('%Y%m%d%H%M%S')
     try:
         temp_page = pywikibot.Page(SITE, title)
         original_ns = temp_page.namespace()
@@ -1318,7 +1344,7 @@ def read_cache_moved(existing_titles, cutoff_date, cached_pages_by_title=None):
                         oldest = page_obj.oldest_revision
                         timestamp = ts_utc_to_it(oldest.timestamp)
                     except Exception:
-                        timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+                        timestamp = now_it().strftime('%Y%m%d%H%M%S')
                     record = {
                         'titolo': title,
                         'timestamp': timestamp,
@@ -1525,7 +1551,7 @@ def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
     found_titles = {}
     checked = 0
     skipped_cached = 0
-    now_str = datetime.now().strftime('%Y%m%d%H%M%S')
+    now_str = now_it().strftime('%Y%m%d%H%M%S')
 
     try:
         logs = site.logevents(logtype='move', total=MAX_ITERATIONS * 500)
@@ -1679,7 +1705,7 @@ def download_page_data(titles, existing_titles, cutoff_date, moves_cache=None, m
     skipped_notexist = []
     skipped_redirect = []
     skipped_error = []
-    now_str = datetime.now().strftime('%Y%m%d%H%M%S')
+    now_str = now_it().strftime('%Y%m%d%H%M%S')
     mc_counter = 0  # contatore per checkpoint moves_cache
 
     for i, title in enumerate(titles):
@@ -1983,14 +2009,14 @@ def format_lua_data(pages_data, part_number, total_parts):
       {titolo, timestamp, {categorie}, {{tmpl_nome,{params}}, ...}, preview}
     """
     lines = []
-    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    now_str = now_it().strftime('%Y-%m-%d %H:%M:%S')
     lines.append("-- Dati automatici per Modulo:VociRecenti")
     lines.append(f"-- PARTE {part_number} di {total_parts}")
     lines.append(f"-- Aggiornato: {now_str} ora italiana")
     lines.append(f"-- VERSIONE {VERSION}")
     lines.append("-- tz=IT\n")
     lines.append("return {")
-    lines.append(f"  u={lua_str(datetime.now().strftime('%d/%m/%Y %H:%M'))},")
+    lines.append(f"  u={lua_str(now_it().strftime('%d/%m/%Y %H:%M'))},")
     lines.append(f"  v={lua_str(VERSION)},")
     lines.append(f"  p={part_number},")
     lines.append(f"  tp={total_parts},")
@@ -2327,7 +2353,7 @@ def main():
     # Usa move_timestamp se presente (voci da sandbox spostate di recente),
     # altrimenti timestamp di creazione. Cutoff fisso a MAX_AGE_DAYS giorni fa,
     # indipendente dalla voce più vecchia in cache (a differenza di cutoff_date).
-    cutoff_30 = datetime.now() - timedelta(days=MAX_AGE_DAYS)
+    cutoff_30 = now_it() - timedelta(days=MAX_AGE_DAYS)
     cutoff_30_str = cutoff_30.strftime('%Y%m%d%H%M%S')
     before_filter = len(cached_pages)
     cached_pages = [
