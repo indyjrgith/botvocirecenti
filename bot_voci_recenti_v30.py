@@ -1560,7 +1560,7 @@ def get_new_creations_since_cutoff(existing_titles, cutoff_str):
                     # Se la voce e' una ricreazione, salva il timestamp RC.
                     # download_page_data usera' questo al posto di oldest_revision
                     # per il controllo eta', trattando la ricreazione come voce nuova.
-                    tags = [t.get('name', '') for t in change.get('tags', [])]
+                    tags = change.get('tags', [])
                     if 'mw-recreated' in tags and rc_ts:
                         try:
                             dt_utc = datetime.strptime(rc_ts, '%Y%m%d%H%M%S')
