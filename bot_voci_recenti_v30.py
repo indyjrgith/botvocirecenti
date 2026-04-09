@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v8.42
+Bot VociRecenti v8.43
 
 Changelog:
+- v8.43: FIX ricreazioni: le voci con tag mw-recreated venivano scartate come
+         "troppo vecchie" perche' download_page_data usava oldest_revision
+         (data della creazione originale) invece della data della ricreazione.
+         get_new_creations_since_cutoff ora richiede rcprop='title|timestamp|tags'
+         e restituisce un dict {titolo: rc_ts_str} invece di un set, segnalando
+         le ricreazioni in recreation_timestamps. get_new_pages_only unisce
+         recreation_timestamps e move_timestamps in un unico dict passato a
+         download_page_data, che gia' usava il timestamp alternativo per gli
+         spostamenti da sandbox. Le voci ricreate vengono ora trattate come
+         voci nuove a tutti gli effetti, con la data di ricreazione come
+         riferimento per il controllo eta'.
 - v8.42: FIX timestamp IT: su Toolforge ts_utc_to_it() restituiva UTC perche'
          ZoneInfo('Europe/Rome').astimezone() non funzionava (database timezone
          assente o non accessibile). Rimossa totalmente la dipendenza da
@@ -254,7 +265,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '8.42'
+VERSION = '8.43'
 MAX_AGE_DAYS = 30       
 config.put_throttle = 1
 config.minthrottle = 0
@@ -1463,9 +1474,9 @@ def get_new_pages_only(existing_titles, cutoff_date, moves_cache):
 
     # Fonte 1: creazioni dirette in NS0
     print("\nFonte 1: Creazioni dirette NS0...")
-    direct = get_new_creations_since_cutoff(existing_titles, cutoff_str)
+    direct, recreation_timestamps = get_new_creations_since_cutoff(existing_titles, cutoff_str)
     candidate_titles.update(direct)
-    print(f"  Trovate: {len(direct)} voci candidate")
+    print(f"  Trovate: {len(direct)} voci candidate ({len(recreation_timestamps)} ricreazioni)")
 
     # Fonte 2: spostamenti nel log NS0 (da altri NS)
     print("\nFonte 2: Spostamenti in NS0 dal log...")
@@ -1473,7 +1484,10 @@ def get_new_pages_only(existing_titles, cutoff_date, moves_cache):
     # moved e' un dict {titolo: move_timestamp}; aggiorna candidate_titles (set)
     # e costruisce move_timestamps per propagare il ts a download_page_data
     candidate_titles.update(moved.keys())
-    move_timestamps = moved  # {titolo: move_ts_str}
+    # Unisce recreation_timestamps e move_timestamps in un unico dict.
+    # In caso di sovrapposizione (voce ricreata E spostata), move_timestamps
+    # ha la precedenza (spostamento e' piu' recente e informativo).
+    move_timestamps = {**recreation_timestamps, **moved}
     print(f"  Trovate: {len(moved)} voci spostate")
 
     print(f"\nTotale candidate NS0: {len(candidate_titles)}")
@@ -1489,9 +1503,17 @@ def get_new_creations_since_cutoff(existing_titles, cutoff_str):
     Scorre RecentChanges NS0 (solo nuove creazioni) dal piu' recente
     fino a quando il timestamp scende sotto cutoff_str.
     Raccoglie tutti i titoli non in existing_titles senza limite numerico.
+
+    Restituisce una tupla (found_titles, recreation_timestamps) dove:
+    - found_titles: set di tutti i titoli candidati
+    - recreation_timestamps: dict {titolo: rc_ts_str} per le voci con tag
+      mw-recreated. Usato da get_new_pages_only per passare il timestamp
+      della ricreazione a download_page_data al posto di oldest_revision,
+      evitando che la voce venga scartata come "troppo vecchia".
     """
     site = SITE
     found_titles = set()
+    recreation_timestamps = {}
     iteration = 0
     total_checked = 0
 
@@ -1502,7 +1524,7 @@ def get_new_creations_since_cutoff(existing_titles, cutoff_str):
         'rcnamespace': NAMESPACE,
         'rcshow': '!redirect|!bot',
         'rclimit': 500,
-        'rcprop': 'title|timestamp',
+        'rcprop': 'title|timestamp|tags',
         'rcdir': 'older',
         'format': 'json'
     }
@@ -1535,9 +1557,20 @@ def get_new_creations_since_cutoff(existing_titles, cutoff_str):
                     break
                 if title not in existing_titles:
                     found_titles.add(title)
+                    # Se la voce e' una ricreazione, salva il timestamp RC.
+                    # download_page_data usera' questo al posto di oldest_revision
+                    # per il controllo eta', trattando la ricreazione come voce nuova.
+                    tags = [t.get('name', '') for t in change.get('tags', [])]
+                    if 'mw-recreated' in tags and rc_ts:
+                        try:
+                            dt_utc = datetime.strptime(rc_ts, '%Y%m%d%H%M%S')
+                            rc_ts_it = (dt_utc + timedelta(hours=_it_offset_for_utc(dt_utc))).strftime('%Y%m%d%H%M%S')
+                        except Exception:
+                            rc_ts_it = rc_ts
+                        recreation_timestamps[title] = rc_ts_it
 
             if iteration % 5 == 0:
-                print(f"    [{iteration}] Trovate: {len(found_titles)}, Controllate: {total_checked}")
+                print(f"    [{iteration}] Trovate: {len(found_titles)}, Controllate: {total_checked}, Ricreate: {len(recreation_timestamps)}")
 
             if stop:
                 break
@@ -1551,8 +1584,8 @@ def get_new_creations_since_cutoff(existing_titles, cutoff_str):
             print(f"    Errore API: {e}")
             break
 
-    print(f"    Totale controllate: {total_checked}, nuove trovate: {len(found_titles)}")
-    return found_titles
+    print(f"    Totale controllate: {total_checked}, nuove trovate: {len(found_titles)}, ricreate: {len(recreation_timestamps)}")
+    return found_titles, recreation_timestamps
 
 
 def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
