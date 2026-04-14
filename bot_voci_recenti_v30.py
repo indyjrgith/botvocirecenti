@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v8.43
+Bot VociRecenti v8.44
 
 Changelog:
+- v8.44: FIX confronto UTC vs IT in get_new_creations_since_cutoff e
+         scan_other_namespaces: rc_ts proveniente dall'API MediaWiki e' in UTC
+         grezzo, ma cutoff_str e' generato da now_it() in ora italiana (CEST +2).
+         Il confronto rc_ts < cutoff_str era sfasato di 2 ore: il loop si
+         fermava 2 ore prima del cutoff reale, perdendo le voci create
+         nell'ultima/ultime 2 ore. Fix: rc_ts viene convertito in IT tramite
+         _it_offset_for_utc prima del confronto (rc_ts_it). Per le ricreazioni
+         (mw-recreated) in get_new_creations_since_cutoff la variabile rc_ts_it
+         gia' calcolata viene riusata direttamente, eliminando la doppia
+         conversione presente in v8.43.
 - v8.43: FIX ricreazioni: le voci con tag mw-recreated venivano scartate come
          "troppo vecchie" perche' download_page_data usava oldest_revision
          (data della creazione originale) invece della data della ricreazione.
@@ -1125,7 +1135,17 @@ def scan_other_namespaces(cutoff_date):
                     if not title:
                         continue
                     rc_ts = change.get('timestamp', '').replace('-','').replace('T','').replace(':','').replace('Z','')
-                    if rc_ts and rc_ts < cutoff_str:
+                    # Converti rc_ts (UTC grezzo) in ora italiana prima del confronto
+                    # con cutoff_str (IT), allineato al fix di get_new_creations_since_cutoff.
+                    if rc_ts:
+                        try:
+                            dt_utc = datetime.strptime(rc_ts, '%Y%m%d%H%M%S')
+                            rc_ts_it = (dt_utc + timedelta(hours=_it_offset_for_utc(dt_utc))).strftime('%Y%m%d%H%M%S')
+                        except Exception:
+                            rc_ts_it = rc_ts
+                    else:
+                        rc_ts_it = rc_ts
+                    if rc_ts_it and rc_ts_it < cutoff_str:
                         stop = True
                         break
                     if title not in seen:
@@ -1552,21 +1572,28 @@ def get_new_creations_since_cutoff(existing_titles, cutoff_str):
                 if not title:
                     continue
                 rc_ts = change.get('timestamp', '').replace('-','').replace('T','').replace(':','').replace('Z','')
-                if rc_ts and rc_ts < cutoff_str:
+                # Converti rc_ts (UTC grezzo) in ora italiana prima del confronto
+                # con cutoff_str (che e' generato da now_it() -> IT).
+                # Senza questa conversione il loop si ferma 2 ore prima del cutoff
+                # reale (CEST +2), perdendo le voci create nell'ultima/ultime 2 ore.
+                if rc_ts:
+                    try:
+                        dt_utc = datetime.strptime(rc_ts, '%Y%m%d%H%M%S')
+                        rc_ts_it = (dt_utc + timedelta(hours=_it_offset_for_utc(dt_utc))).strftime('%Y%m%d%H%M%S')
+                    except Exception:
+                        rc_ts_it = rc_ts
+                else:
+                    rc_ts_it = rc_ts
+                if rc_ts_it and rc_ts_it < cutoff_str:
                     stop = True
                     break
                 if title not in existing_titles:
                     found_titles.add(title)
-                    # Se la voce e' una ricreazione, salva il timestamp RC.
+                    # Se la voce e' una ricreazione, salva il timestamp RC (gia' in IT).
                     # download_page_data usera' questo al posto di oldest_revision
                     # per il controllo eta', trattando la ricreazione come voce nuova.
                     tags = change.get('tags', [])
-                    if 'mw-recreated' in tags and rc_ts:
-                        try:
-                            dt_utc = datetime.strptime(rc_ts, '%Y%m%d%H%M%S')
-                            rc_ts_it = (dt_utc + timedelta(hours=_it_offset_for_utc(dt_utc))).strftime('%Y%m%d%H%M%S')
-                        except Exception:
-                            rc_ts_it = rc_ts
+                    if 'mw-recreated' in tags and rc_ts_it:
                         recreation_timestamps[title] = rc_ts_it
 
             if iteration % 5 == 0:
