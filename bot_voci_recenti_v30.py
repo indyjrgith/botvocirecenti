@@ -1845,15 +1845,15 @@ def download_page_data(titles, existing_titles, cutoff_date, moves_cache=None, m
             # altrimenti usa la data di creazione originale
             move_ts_str = move_timestamps.get(title) if move_timestamps else None
             if move_ts_str:
-    try:
-        ref_date = datetime.strptime(move_ts_str, '%Y%m%d%H%M%S')
-    except Exception:
-        ref_date = created.replace(tzinfo=None)
-    # Per ricreazioni e spostamenti usa rc_ts_it/move_ts come timestamp in cache,
-    # non oldest_revision che punterebbe alla versione storica (es. redirect di anni fa)
-    timestamp = move_ts_str
-else:
-    ref_date = created.replace(tzinfo=None)
+                try:
+                    ref_date = datetime.strptime(move_ts_str, '%Y%m%d%H%M%S')
+                except Exception:
+                    ref_date = created.replace(tzinfo=None)
+                # Per ricreazioni e spostamenti usa rc_ts_it/move_ts come timestamp in cache,
+                # non oldest_revision che punterebbe alla versione storica (es. redirect di anni fa)
+                timestamp = move_ts_str
+            else:
+                ref_date = created.replace(tzinfo=None)
 
             if ref_date < cutoff_date:
                 skipped_old.append(title)
