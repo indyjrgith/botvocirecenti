@@ -321,7 +321,7 @@ PULIZIA_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Puliz
 
 # Versione minima richiesta di PuliziaCache.py
 # Il bot rifiuta di eseguire PuliziaCache se la versione presente è inferiore
-REQUIRED_PULIZIA_VERSION = 'PC-2.8'
+REQUIRED_PULIZIA_VERSION = 'PC-2.9'
 
 # File di log (nella stessa cartella del bot)
 # L'output viene scritto sia a video che nel file di log

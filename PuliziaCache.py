@@ -1,9 +1,24 @@
 #!/usr/bin/env python3
 """
 PuliziaCache.py - Script di pulizia cache VociRecenti
-Versione PC-2.8
+Versione PC-2.9
 
 Changelog:
+- PC-2.9: TRE FIX in _fetch_categories_for_titles / check_and_update_pages_batch:
+          FIX-A: rimosso clshow=!hidden da _fetch_categories_for_titles: le categorie
+          delle pagine di disambiguazione (e altre categorie di servizio) sono nascoste
+          e venivano silenziosamente scartate -> disambigue sempre con categorie=[] in
+          cache indipendentemente dal numero di run eseguiti.
+          FIX-B: lookup titolo in cats_by_title reso robusto con fallback normalizzato:
+          se orig_title non e' in cats_by_title si prova con il titolo normalizzato da
+          all_normalized (passata info). Evita che voci con normalizzazione Wikipedia
+          (maiuscole, underscore) restino con categorie vuote nonostante l'API le abbia
+          restituite correttamente.
+          FIX-C: aggiornamento forzato se old_cats==[] e new_cats!=[]: le voci inserite
+          in cache prima di avere categorie non venivano mai aggiornate: il confronto
+          set([])==set([]) era True anche se l'API non aveva trovato il titolo (FIX-B
+          non ancora applicato), mascherando il mancato aggiornamento. Ora cats_changed
+          e' True anche quando old_cats era vuota ma new_cats e' non vuota.
 - PC-2.8: Correzione one-shot timestamp corrotti in cache.
           _fetch_wikitext_for_titles ora esegue due chiamate batch per titolo:
           (A) rvdir=newer&rvlimit=1 per il timestamp reale di prima creazione,
@@ -142,7 +157,7 @@ def ts_utc_to_it(ts_str):
 # ========================================
 # CONFIGURAZIONE
 # ========================================
-VERSION = 'PC-2.8'
+VERSION = 'PC-2.9'
 MAX_PAGES = 3000
 MAX_CHARS_PER_FILE = 1500000
 DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
@@ -875,7 +890,9 @@ def _fetch_categories_for_titles(titles):
             'prop': 'categories',
             'titles': '|'.join(batch),
             'cllimit': '500',
-            'clshow': '!hidden',
+            # NON usare clshow='!hidden': le categorie delle disambigue e di altri
+            # template di servizio sono nascoste e verrebbero scartate -> voci
+            # di disambiguazione risulterebbero sempre senza categorie in cache.
             'format': 'json',
         }
 
@@ -1132,14 +1149,24 @@ def check_and_update_pages_batch(pages):
         rev_data = rev_by_title.get(orig_title, {})
         wikitext = rev_data.get('wikitext', '')
         creation_ts = rev_data.get('creation_ts', '')
-        new_cats = cats_by_title.get(orig_title, [])
+        # FIX-B: se orig_title non e' in cats_by_title (es. normalizzazione Wikipedia),
+        # prova con il titolo normalizzato ricavato dalla passata info.
+        if orig_title in cats_by_title:
+            new_cats = cats_by_title[orig_title]
+        else:
+            norm_title = all_normalized.get(orig_title, orig_title)
+            new_cats = cats_by_title.get(norm_title, [])
         new_templates = parse_templates_from_wikitext(wikitext)
         new_preview = wikitext[:100].replace('\n', ' ').strip() if wikitext else ''
 
         old_cats = record.get('categorie', [])
         old_templates = record.get('templates', [])
 
-        cats_changed = set(new_cats) != set(old_cats)
+        # FIX-C: forza aggiornamento se old_cats era vuota e ora ci sono categorie.
+        # Senza questo fix, una voce inserita in cache prima di avere categorie
+        # non veniva mai aggiornata: set([])==set([]) anche quando l'API
+        # non trovava il titolo (FIX-B non ancora applicato).
+        cats_changed = set(new_cats) != set(old_cats) or (not old_cats and bool(new_cats))
         old_tmpl_set = {(t.get('nome', ''), tuple(t.get('params', [])))
                         for t in old_templates}
         new_tmpl_set = {(t.get('nome', ''), tuple(t.get('params', [])))
