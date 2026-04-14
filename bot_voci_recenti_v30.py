@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v8.45
+Bot VociRecenti v8.46
 
 Changelog:
+- v8.46: FIX timestamp voci spostate: il campo timestamp (data visibile nella lista)
+         tornato a essere sempre la data di prima creazione (oldest_revision), come
+         stabilito in origine. move_ts_str e' usato esclusivamente come ref_date
+         per il controllo eta' e come move_timestamp nel record (per STEP 6 e
+         PuliziaCache), non sovrascrive piu' il timestamp della voce.
+         FIX spostamenti NS0->NS0: get_moved_to_ns0_since_cutoff ora scarta i
+         log dove il namespace sorgente e' gia' 0 (ridenominazioni, inversioni
+         di redirect interne a NS0): vengono accettati solo spostamenti da
+         NS!=0 verso NS0. Il log stampa ora anche il namespace sorgente:
+         "Spostamento NS2->NS0: ...".
 - v.8.45: Per ricreazioni e spostamenti usa rc_ts_it/move_ts come timestamp in cache,
      non oldest_revision che punterebbe alla versione storica (es. redirect di anni fa)
 - v8.44: FIX confronto UTC vs IT in get_new_creations_since_cutoff e
@@ -277,7 +287,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '8.45'
+VERSION = '8.46'
 MAX_AGE_DAYS = 30       
 config.put_throttle = 1
 config.minthrottle = 0
@@ -1620,10 +1630,10 @@ def get_new_creations_since_cutoff(existing_titles, cutoff_str):
 def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
     """
     Scorre il log degli spostamenti fino al cutoff_date.
-    Raccoglie tutti i titoli destinazione in NS0 non gia' in existing_titles,
-    indipendentemente dal namespace sorgente. Questo cattura:
-    - spostamenti da sandbox/bozze/utente (NS!=0 -> NS0)
-    - ridenominazioni e inversioni di redirect interne (NS0 -> NS0)
+    Raccoglie solo i titoli destinazione in NS0 provenienti da un namespace
+    sorgente diverso da 0 (NS2 Utente, NS118 Bozze, ecc.).
+    Gli spostamenti NS0->NS0 (ridenominazioni, inversioni di redirect) vengono
+    ignorati: non rappresentano creazioni di nuove voci.
     La verifica del cutoff sulla data di creazione avviene in download_page_data.
 
     moves_cache: dict persistente tra i run. Le voci rifiutate (not NS0, non
@@ -1674,7 +1684,19 @@ def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
                     skipped_cached += 1
                     continue
 
-                # Verifica namespace via API
+                # Scarta spostamenti NS0->NS0 (ridenominazioni, inversioni redirect):
+                # interessano solo spostamenti da altri namespace verso NS0.
+                source_page = log.page()
+                source_ns = int(source_page.namespace())
+                if source_ns == 0:
+                    moves_cache[target_title] = {
+                        'processed_at': now_str,
+                        'result': 'rejected',
+                        'reason': 'ns0_to_ns0'
+                    }
+                    continue
+
+                # Verifica namespace destinazione via API
                 target_page = pywikibot.Page(site, target_title)
                 if int(target_page.namespace()) != 0:
                     moves_cache[target_title] = {
@@ -1684,16 +1706,15 @@ def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
                     }
                     continue
 
-                # Voce accettata: aggiorna cache e aggiungi ai candidati
-                # con il timestamp dello spostamento
+                # Voce accettata: spostamento da NS!=0 verso NS0
                 moves_cache[target_title] = {
                     'processed_at': now_str,
                     'result': 'accepted',
                     'reason': 'ns0'
                 }
                 found_titles[target_title] = move_ts_str
-                source_title = log.page().title()
-                print(f"    Spostamento -> NS0: '{source_title}' -> '{target_title}'")
+                source_title = source_page.title()
+                print(f"    Spostamento NS{source_ns}->NS0: '{source_title}' -> '{target_title}'")
 
             except Exception:
                 continue
@@ -1849,9 +1870,9 @@ def download_page_data(titles, existing_titles, cutoff_date, moves_cache=None, m
                     ref_date = datetime.strptime(move_ts_str, '%Y%m%d%H%M%S')
                 except Exception:
                     ref_date = created.replace(tzinfo=None)
-                # Per ricreazioni e spostamenti usa rc_ts_it/move_ts come timestamp in cache,
-                # non oldest_revision che punterebbe alla versione storica (es. redirect di anni fa)
-                timestamp = move_ts_str
+                # Il timestamp da mostrare e' sempre la data di prima creazione (oldest_revision).
+                # move_ts_str e' usato solo come ref_date per il controllo eta' e come
+                # move_timestamp nel record, NON come timestamp della voce.
             else:
                 ref_date = created.replace(tzinfo=None)
 
