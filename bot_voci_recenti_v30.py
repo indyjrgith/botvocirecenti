@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.0
+Bot VociRecenti v9.1
 
 Changelog:
+- v9.1: FIX doppia scrittura su Wikipedia: rimossa la chiamata a _cleanup_save_cache
+        da run_cleanup_internal (che ora restituisce solo i dati puliti senza scrivere).
+        Il salvataggio avviene una sola volta in STEP 7, come previsto dalla fusione v9.0.
+        FIX timestamp creazione non disponibile: aggiunto rvstart='2000-01-01T00:00:00Z'
+        alla chiamata rvdir=newer per compatibilita' con MediaWiki; aggiunta CHIAMATA C
+        di fallback senza rvstart per i titoli che ancora mancano di creation_ts;
+        promosse le eccezioni da _clog_only a print per renderle visibili nel log principale.
 - v9.0: MAJOR RELEASE — Fusione completa di PuliziaCache.py nel bot.
         La pulizia cache non e' piu' uno script separato: viene eseguita
         internamente al bot nella stessa esecuzione, eliminando la doppia
@@ -139,7 +146,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.0'
+VERSION = '9.1'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -1063,10 +1070,12 @@ def _cleanup_fetch_wikitext_for_titles(titles):
                 titles='|'.join(batch),
                 rvprop='timestamp',
                 rvdir='newer',
+                rvstart='2000-01-01T00:00:00Z',
                 rvlimit='1',
                 format='json',
             ).submit()
         except Exception as e:
+            print(f"  WARNING _fetch_creation_ts batch [{start//CLEANUP_BATCH_SIZE_REV + 1}]: {e}")
             _clog_only(f"  WARNING _fetch_creation_ts batch: {e}")
             continue
         query_data = result.get('query', {})
@@ -1124,6 +1133,41 @@ def _cleanup_fetch_wikitext_for_titles(titles):
     for t in titles:
         if t not in result_by_title:
             result_by_title[t] = {'wikitext': '', 'creation_ts': ''}
+
+    # --- CHIAMATA C: fallback per titoli senza creation_ts ---
+    # Se la chiamata A (rvdir=newer) ha fallito per alcuni titoli, tenta
+    # con rvdir=newer senza rvstart (compatibilita' con alcune versioni MW).
+    missing_ts = [t for t in titles if not result_by_title.get(t, {}).get('creation_ts')]
+    if missing_ts:
+        _clog_only(f"  Fallback creation_ts per {len(missing_ts)} titoli (senza rvstart)...")
+        for start in range(0, len(missing_ts), CLEANUP_BATCH_SIZE_REV):
+            batch = missing_ts[start:start + CLEANUP_BATCH_SIZE_REV]
+            try:
+                res2 = SITE.simple_request(
+                    action='query',
+                    prop='revisions',
+                    titles='|'.join(batch),
+                    rvprop='timestamp',
+                    rvdir='newer',
+                    rvlimit='1',
+                    format='json',
+                ).submit()
+                q2 = res2.get('query', {})
+                inv2 = {n_e['to']: n_e['from'] for n_e in q2.get('normalized', [])}
+                for pid, pinfo in q2.get('pages', {}).items():
+                    if pid == '-1' or 'missing' in pinfo:
+                        continue
+                    tr = pinfo.get('title', '')
+                    orig = inv2.get(tr, tr)
+                    revs = pinfo.get('revisions', [])
+                    if revs:
+                        ts_utc = revs[0].get('timestamp', '')
+                        if ts_utc:
+                            ts_it = ts_utc_str_to_it(ts_utc)
+                            result_by_title[orig]['creation_ts'] = ts_it
+                            _clog_only(f"  Fallback OK {orig}: {ts_it}")
+            except Exception as e2:
+                print(f"  WARNING fallback creation_ts [{start//CLEANUP_BATCH_SIZE_REV + 1}]: {e2}")
 
     return result_by_title
 
@@ -1544,11 +1588,11 @@ def run_cleanup_internal(cached_pages, cache_files_count):
         print("REPORT DIAGNOSTICO [DRY-RUN]")
         print("=" * 60)
         _cleanup_dry_run_report(cached_pages)
-        print("\n*** DRY-RUN completato: nessun file e' stato modificato su Wikipedia ***")
+        print("\n*** DRY-RUN: nessun file modificato (il salvataggio avverra' in STEP 7) ***")
     else:
-        print("SALVATAGGIO CACHE PULITA")
+        print("PULIZIA COMPLETATA")
         print("=" * 60)
-        _cleanup_save_cache(cached_pages, cache_files_count)
+        print("  Salvataggio rinviato a STEP 7 (scrittura unica su Wikipedia).")
 
     end_time = datetime.now()
     _clog_only(f"\nFine pulizia: {end_time.strftime('%Y-%m-%d %H:%M:%S')} "
