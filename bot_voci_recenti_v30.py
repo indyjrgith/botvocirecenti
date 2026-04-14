@@ -149,7 +149,7 @@ config.maxthrottle = 2
 # Se True: esegue tutte le fasi e tutte le chiamate API ma NON salva nulla
 # su Wikipedia. Utile per testing senza interrompere il bot in produzione.
 # Puo' essere attivata anche da riga di comando con --dry-run.
-DRY_RUN = True
+DRY_RUN = False
 
 # --- Configurazione pulizia automatica ---
 # 'Once'  = una volta per fascia oraria
