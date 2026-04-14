@@ -1,9 +1,31 @@
 #!/usr/bin/env python3
 """
 PuliziaCache.py - Script di pulizia cache VociRecenti
-Versione PC-2.6
+Versione PC-2.8
 
 Changelog:
+- PC-2.8: Correzione one-shot timestamp corrotti in cache.
+          _fetch_wikitext_for_titles ora esegue due chiamate batch per titolo:
+          (A) rvdir=newer&rvlimit=1 per il timestamp reale di prima creazione,
+          (B) rvdir=older (default) per il wikitext corrente.
+          Restituisce dict {titolo: {'wikitext': ..., 'creation_ts': ...}}.
+          Aggiunta ts_utc_to_it() per convertire i timestamp ISO 8601 dall'API.
+          check_and_update_pages_batch: sovrascrive sempre il campo timestamp
+          con il valore reale dall'API, loggando ogni correzione con i valori
+          vecchio e nuovo. Il contatore 'timestamp corretti' e' incluso nel
+          riepilogo di FASE 3. Questa correzione avviene ad ogni run di PC
+          (nessun overhead extra: le chiamate API erano gia' presenti per il
+          wikitext), ed e' idempotente: una volta che i timestamp sono corretti
+          non produce piu' aggiornamenti.
+- PC-2.7: FIX flag tz in format_lua_data: scritto '-- tz=IT' invece di
+          '-- tz=IT-v8.42', causando la migrazione one-shot UTC->IT ad ogni
+          run successivo del bot (doppia/tripla conversione timestamp).
+          Effetti: timestamp delle voci in cache progressivamente in avanti
+          nel tempo, voci nuove scalzate dal sort/MAX_PAGES.
+          Fix: flag corretto a '-- tz=IT-v8.42'.
+          Aggiunta funzione now_it() (con _last_sunday e _it_offset_for_utc)
+          per scrivere il campo u= e l'header Aggiornato: in ora italiana
+          invece di UTC (import calendar aggiunto).
 - PC-2.6: FIX _fetch_wikitext_for_titles: corretto accesso al wikitext dalla
           risposta API rvslots=main: il campo e' "slots.main.*" non "slots.main.content".
           Senza questo fix il wikitext era sempre vuoto -> templates=[] e preview=""
@@ -69,12 +91,58 @@ import pywikibot
 import pywikibot.config as config
 import re
 import os
+import calendar as _calendar
 from datetime import datetime, timedelta
+
+
+# ========================================
+# FUSO ORARIO ITALIANO - stesso algoritmo del bot (senza dipendenze esterne)
+# ========================================
+
+def _last_sunday(year, month):
+    """Restituisce il giorno (int) dell'ultima domenica del mese dato."""
+    last_day = _calendar.monthrange(year, month)[1]
+    last_weekday = datetime(year, month, last_day).weekday()  # 0=lun, 6=dom
+    return last_day - (last_weekday - 6) % 7
+
+
+def _it_offset_for_utc(dt_utc_naive):
+    """Restituisce l'offset italiano in ore (+1 CET, +2 CEST) per un datetime UTC naive."""
+    y = dt_utc_naive.year
+    dst_start = datetime(y, 3,  _last_sunday(y, 3),  1, 0, 0)
+    dst_end   = datetime(y, 10, _last_sunday(y, 10), 1, 0, 0)
+    return 2 if dst_start <= dt_utc_naive < dst_end else 1
+
+
+def now_it():
+    """Restituisce il datetime corrente in ora italiana (CET/CEST) come oggetto naive."""
+    from datetime import timezone as _tz
+    utc_now = datetime.now(_tz.utc).replace(tzinfo=None)
+    return utc_now + timedelta(hours=_it_offset_for_utc(utc_now))
+
+
+def ts_utc_to_it(ts_str):
+    """
+    Converte una stringa timestamp UTC in formato ISO 8601 (es. '2026-04-14T01:35:00Z')
+    oppure YYYYMMDDHHMMSS nella corrispondente stringa YYYYMMDDHHMMSS in ora italiana.
+    """
+    ts_str = ts_str.strip()
+    # Formato ISO 8601: 2026-04-14T01:35:00Z
+    if 'T' in ts_str:
+        ts_str_clean = ts_str.replace('Z', '').replace('-', '').replace('T', '').replace(':', '')
+    else:
+        ts_str_clean = ts_str
+    try:
+        dt = datetime.strptime(ts_str_clean, '%Y%m%d%H%M%S')
+        return (dt + timedelta(hours=_it_offset_for_utc(dt))).strftime('%Y%m%d%H%M%S')
+    except Exception:
+        return ts_str_clean
+
 
 # ========================================
 # CONFIGURAZIONE
 # ========================================
-VERSION = 'PC-2.6'
+VERSION = 'PC-2.8'
 MAX_PAGES = 3000
 MAX_CHARS_PER_FILE = 1500000
 DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
@@ -859,14 +927,55 @@ def _fetch_categories_for_titles(titles):
 
 def _fetch_wikitext_for_titles(titles):
     """
-    Scarica il wikitext per una lista di titoli tramite API batch.
+    Scarica il wikitext e il timestamp di prima creazione per una lista di titoli
+    tramite API batch. Usa due chiamate separate per batch:
+      - rvdir=newer&rvlimit=1: prima revisione (timestamp creazione reale)
+      - rvdir=older&rvlimit=1: ultima revisione (wikitext corrente)
     Usa batch piccoli (BATCH_SIZE_REV titoli) per evitare che MediaWiki
     tronchi silenziosamente le revisions su pagine grandi.
-    Restituisce un dict {titolo_originale: wikitext}.
+    Restituisce un dict {titolo_originale: {'wikitext': str, 'creation_ts': str}}
+    dove creation_ts e' in formato YYYYMMDDHHMMSS ora italiana, oppure '' se non
+    disponibile.
     """
     BATCH_SIZE_REV = 10  # batch piccolo: wikitext puo' essere molto grande
-    wikitext_by_title = {}
+    result_by_title = {}
 
+    # --- CHIAMATA A: timestamp di prima creazione (rvdir=newer, rvlimit=1) ---
+    creation_ts_by_title = {}
+    for start in range(0, len(titles), BATCH_SIZE_REV):
+        batch = titles[start:start + BATCH_SIZE_REV]
+        try:
+            result = SITE.simple_request(
+                action='query',
+                prop='revisions',
+                titles='|'.join(batch),
+                rvprop='timestamp',
+                rvdir='newer',
+                rvlimit='1',
+                format='json',
+            ).submit()
+        except Exception as e:
+            log_only(f"  WARNING _fetch_creation_ts batch: {e}")
+            continue
+
+        query_data = result.get('query', {})
+        inv_norm = {n_entry['to']: n_entry['from']
+                    for n_entry in query_data.get('normalized', [])}
+
+        for page_id, page_info in query_data.get('pages', {}).items():
+            if page_id == '-1' or 'missing' in page_info:
+                continue
+            title_result = page_info.get('title', '')
+            orig_title = inv_norm.get(title_result, title_result)
+            try:
+                revisions = page_info.get('revisions', [])
+                if revisions:
+                    ts_utc = revisions[0].get('timestamp', '')
+                    creation_ts_by_title[orig_title] = ts_utc_to_it(ts_utc) if ts_utc else ''
+            except Exception:
+                pass
+
+    # --- CHIAMATA B: wikitext corrente (rvdir=older, rvlimit=1 = default) ---
     for start in range(0, len(titles), BATCH_SIZE_REV):
         batch = titles[start:start + BATCH_SIZE_REV]
         try:
@@ -904,23 +1013,32 @@ def _fetch_wikitext_for_titles(titles):
             except Exception:
                 pass
 
-            wikitext_by_title[orig_title] = wikitext
+            result_by_title[orig_title] = {
+                'wikitext': wikitext,
+                'creation_ts': creation_ts_by_title.get(orig_title, ''),
+            }
 
-    return wikitext_by_title
+    # Assicura che tutti i titoli abbiano una entry (anche se entrambe le chiamate falliscono)
+    for t in titles:
+        if t not in result_by_title:
+            result_by_title[t] = {'wikitext': '', 'creation_ts': ''}
+
+    return result_by_title
 
 
 def check_and_update_pages_batch(pages):
     """
     Verifica e aggiorna i metadati di tutte le voci in cache tramite API batch.
-    Tre chiamate separate per batch:
+    Tre passate separate per batch:
       1. prop=info (BATCH_SIZE=50): rilevamento missing/redirect/NS
       2. prop=categories (BATCH_SIZE=50, con paginazione): categorie visibili
-      3. prop=revisions (BATCH_SIZE_REV=10): wikitext per template e preview
-         Batch piccolo necessario: MediaWiki tronca silenziosamente le revisions
-         quando la risposta supera i limiti di dimensione.
+      3. prop=revisions (BATCH_SIZE_REV=10): wikitext corrente + timestamp prima
+         revisione (creazione reale). Batch piccolo necessario: MediaWiki tronca
+         silenziosamente le revisions quando la risposta supera i limiti di dimensione.
 
-    Per ogni voce sopravvissuta: confronta categorie e template con i dati
-    in cache; se cambiati aggiorna il record e logga le differenze.
+    Per ogni voce sopravvissuta: sovrascrive sempre il timestamp con il valore
+    reale dall'API (corregge timestamp corrotti da doppia migrazione UTC->IT).
+    Confronta categorie e template; se cambiati aggiorna il record e logga.
 
     Restituisce (valid_pages, removed_count).
     """
@@ -991,15 +1109,16 @@ def check_and_update_pages_batch(pages):
     cats_by_title = _fetch_categories_for_titles(survivor_titles)
 
     # ========================================================
-    # PASSATA 3: prop=revisions — wikitext per sopravvissuti
+    # PASSATA 3: prop=revisions — wikitext + timestamp creazione per sopravvissuti
     # ========================================================
-    print(f"  Recupero wikitext per {len(survivor_titles)} voci (10 titoli/chiamata)...")
-    wikitext_by_title = _fetch_wikitext_for_titles(survivor_titles)
+    print(f"  Recupero wikitext e timestamp creazione per {len(survivor_titles)} voci (10 titoli/chiamata)...")
+    rev_by_title = _fetch_wikitext_for_titles(survivor_titles)
 
     # ========================================================
     # CONFRONTO e aggiornamento record
     # ========================================================
     batch_by_title = {p['titolo']: p for p in pages}
+    ts_fixed_count = 0
 
     for orig_title in survivor_titles:
         record = batch_by_title.get(orig_title)
@@ -1010,7 +1129,9 @@ def check_and_update_pages_batch(pages):
         if record is None:
             continue
 
-        wikitext = wikitext_by_title.get(orig_title, '')
+        rev_data = rev_by_title.get(orig_title, {})
+        wikitext = rev_data.get('wikitext', '')
+        creation_ts = rev_data.get('creation_ts', '')
         new_cats = cats_by_title.get(orig_title, [])
         new_templates = parse_templates_from_wikitext(wikitext)
         new_preview = wikitext[:100].replace('\n', ' ').strip() if wikitext else ''
@@ -1025,14 +1146,24 @@ def check_and_update_pages_batch(pages):
                         for t in new_templates}
         tmpls_changed = old_tmpl_set != new_tmpl_set
 
-        if cats_changed or tmpls_changed:
+        # Controlla se il timestamp in cache differisce da quello reale (corregge
+        # timestamp corrotti da doppia/tripla migrazione UTC->IT)
+        old_ts = record.get('timestamp', '')
+        ts_changed = bool(creation_ts) and creation_ts != old_ts
+
+        if cats_changed or tmpls_changed or ts_changed:
             updated = dict(record)
             updated['categorie'] = new_cats
             updated['templates'] = new_templates
             updated['preview'] = new_preview
+            if ts_changed:
+                updated['timestamp'] = creation_ts
+                ts_fixed_count += 1
             updated_records[orig_title] = updated
 
             changes = []
+            if ts_changed:
+                changes.append(f'timestamp ({old_ts}->{creation_ts})')
             if cats_changed:
                 changes.append('categorie')
             if tmpls_changed:
@@ -1058,7 +1189,8 @@ def check_and_update_pages_batch(pages):
         else:
             valid_pages.append(page)
 
-    print(f"\nRisultato: {removed_count} voci rimosse, {len(updated_records)} voci aggiornate")
+    print(f"\nRisultato: {removed_count} voci rimosse, {len(updated_records)} voci aggiornate"
+          f" (di cui {ts_fixed_count} timestamp corretti)")
     return valid_pages, removed_count
 
 
@@ -1207,14 +1339,14 @@ def format_lua_data(pages_data, part_number, total_parts):
       {titolo, timestamp, {categorie}, {{tmpl_nome,{params}}, ...}, preview}
     """
     lines = []
-    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    now_str = now_it().strftime('%Y-%m-%d %H:%M:%S')
     lines.append("-- Dati automatici per Modulo:VociRecenti")
     lines.append(f"-- PARTE {part_number} di {total_parts}")
     lines.append(f"-- Aggiornato: {now_str} ora italiana")
     lines.append(f"-- VERSIONE {VERSION}")
-    lines.append("-- tz=IT\n")
+    lines.append("-- tz=IT-v8.42\n")
     lines.append("return {")
-    lines.append(f"  u={lua_str(datetime.now().strftime('%d/%m/%Y %H:%M'))},")
+    lines.append(f"  u={lua_str(now_it().strftime('%d/%m/%Y %H:%M'))},")
     lines.append(f"  v={lua_str(VERSION)},")
     lines.append(f"  p={part_number},")
     lines.append(f"  tp={total_parts},")
