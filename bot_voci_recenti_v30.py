@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.1
+Bot VociRecenti v9.1.1
 
 Changelog:
 - v9.1: FIX doppia scrittura su Wikipedia: rimossa la chiamata a _cleanup_save_cache
         da run_cleanup_internal (che ora restituisce solo i dati puliti senza scrivere).
         Il salvataggio avviene una sola volta in STEP 7, come previsto dalla fusione v9.0.
-        FIX timestamp creazione non disponibile: aggiunto rvstart='2000-01-01T00:00:00Z'
-        alla chiamata rvdir=newer per compatibilita' con MediaWiki; aggiunta CHIAMATA C
-        di fallback senza rvstart per i titoli che ancora mancano di creation_ts;
-        promosse le eccezioni da _clog_only a print per renderle visibili nel log principale.
+        FIX CRITICO timestamp creazione: rvdir=newer con rvlimit su batch multi-titolo
+        genera 'invalidparammix' nell'API MediaWiki (il parametro e' ammesso solo per
+        una pagina alla volta). _cleanup_fetch_wikitext_for_titles ora esegue la
+        CHIAMATA A (rvdir=newer&rvlimit=1) in un loop titolo per titolo; la CHIAMATA B
+        (rvprop=content, nessun parametro di ordinamento) rimane in batch.
 - v9.0: MAJOR RELEASE — Fusione completa di PuliziaCache.py nel bot.
         La pulizia cache non e' piu' uno script separato: viene eseguita
         internamente al bot nella stessa esecuzione, eliminando la doppia
@@ -1051,32 +1052,36 @@ def _cleanup_fetch_categories_for_titles(titles):
 
 def _cleanup_fetch_wikitext_for_titles(titles):
     """
-    Scarica wikitext e timestamp di prima creazione per una lista di titoli
-    tramite due chiamate batch per batch da CLEANUP_BATCH_SIZE_REV titoli:
-      A) rvdir=newer&rvlimit=1: timestamp reale di prima creazione
-      B) rvdir=older&rvlimit=1: wikitext corrente
+    Scarica wikitext e timestamp di prima creazione per una lista di titoli.
+
+    CHIAMATA A — timestamp prima creazione, un titolo alla volta:
+      rvdir=newer e rvlimit non sono compatibili con batch multi-titolo
+      nell'API MediaWiki (invalidparammix). Si itera quindi titolo per titolo.
+      Per attenuare l'impatto sulle performance si usa CLEANUP_BATCH_SIZE_REV
+      come taglia dei gruppi di chiamate consecutive prima di un breve yield.
+
+    CHIAMATA B — wikitext corrente, batch da CLEANUP_BATCH_SIZE_REV titoli:
+      rvprop=content senza parametri di ordinamento: compatibile con batch.
+
     Restituisce dict {titolo: {'wikitext': str, 'creation_ts': str (IT)}}
     """
     result_by_title = {}
     creation_ts_by_title = {}
 
-    # --- CHIAMATA A: timestamp di prima creazione ---
-    for start in range(0, len(titles), CLEANUP_BATCH_SIZE_REV):
-        batch = titles[start:start + CLEANUP_BATCH_SIZE_REV]
+    # --- CHIAMATA A: timestamp di prima creazione (uno per volta) ---
+    for title in titles:
         try:
             result = SITE.simple_request(
                 action='query',
                 prop='revisions',
-                titles='|'.join(batch),
+                titles=title,
                 rvprop='timestamp',
                 rvdir='newer',
-                rvstart='2000-01-01T00:00:00Z',
                 rvlimit='1',
                 format='json',
             ).submit()
         except Exception as e:
-            print(f"  WARNING _fetch_creation_ts batch [{start//CLEANUP_BATCH_SIZE_REV + 1}]: {e}")
-            _clog_only(f"  WARNING _fetch_creation_ts batch: {e}")
+            _clog_only(f"  WARNING _fetch_creation_ts '{title}': {e}")
             continue
         query_data = result.get('query', {})
         inv_norm = {n_entry['to']: n_entry['from']
@@ -1094,7 +1099,7 @@ def _cleanup_fetch_wikitext_for_titles(titles):
             except Exception:
                 pass
 
-    # --- CHIAMATA B: wikitext corrente ---
+    # --- CHIAMATA B: wikitext corrente (batch, nessun parametro incompatibile) ---
     for start in range(0, len(titles), CLEANUP_BATCH_SIZE_REV):
         batch = titles[start:start + CLEANUP_BATCH_SIZE_REV]
         try:
@@ -1132,42 +1137,7 @@ def _cleanup_fetch_wikitext_for_titles(titles):
 
     for t in titles:
         if t not in result_by_title:
-            result_by_title[t] = {'wikitext': '', 'creation_ts': ''}
-
-    # --- CHIAMATA C: fallback per titoli senza creation_ts ---
-    # Se la chiamata A (rvdir=newer) ha fallito per alcuni titoli, tenta
-    # con rvdir=newer senza rvstart (compatibilita' con alcune versioni MW).
-    missing_ts = [t for t in titles if not result_by_title.get(t, {}).get('creation_ts')]
-    if missing_ts:
-        _clog_only(f"  Fallback creation_ts per {len(missing_ts)} titoli (senza rvstart)...")
-        for start in range(0, len(missing_ts), CLEANUP_BATCH_SIZE_REV):
-            batch = missing_ts[start:start + CLEANUP_BATCH_SIZE_REV]
-            try:
-                res2 = SITE.simple_request(
-                    action='query',
-                    prop='revisions',
-                    titles='|'.join(batch),
-                    rvprop='timestamp',
-                    rvdir='newer',
-                    rvlimit='1',
-                    format='json',
-                ).submit()
-                q2 = res2.get('query', {})
-                inv2 = {n_e['to']: n_e['from'] for n_e in q2.get('normalized', [])}
-                for pid, pinfo in q2.get('pages', {}).items():
-                    if pid == '-1' or 'missing' in pinfo:
-                        continue
-                    tr = pinfo.get('title', '')
-                    orig = inv2.get(tr, tr)
-                    revs = pinfo.get('revisions', [])
-                    if revs:
-                        ts_utc = revs[0].get('timestamp', '')
-                        if ts_utc:
-                            ts_it = ts_utc_str_to_it(ts_utc)
-                            result_by_title[orig]['creation_ts'] = ts_it
-                            _clog_only(f"  Fallback OK {orig}: {ts_it}")
-            except Exception as e2:
-                print(f"  WARNING fallback creation_ts [{start//CLEANUP_BATCH_SIZE_REV + 1}]: {e2}")
+            result_by_title[t] = {'wikitext': '', 'creation_ts': creation_ts_by_title.get(t, '')}
 
     return result_by_title
 
