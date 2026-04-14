@@ -276,7 +276,7 @@ config.maxthrottle = 2
 # 'Once'  = una volta per fascia oraria (comportamento default)
 # 'Every' = ad ogni esecuzione del bot
 # 'None'  = mai
-AutoClean = 'Once'
+AutoClean = 'Every'
 
 # Fascia oraria in cui eseguire la pulizia (formato 'HH:MM')
 # La fascia puo' attraversare la mezzanotte (es. '23:00' - '01:00')
@@ -299,7 +299,7 @@ PULIZIA_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Puliz
 
 # Versione minima richiesta di PuliziaCache.py
 # Il bot rifiuta di eseguire PuliziaCache se la versione presente è inferiore
-REQUIRED_PULIZIA_VERSION = 'PC-2.2'
+REQUIRED_PULIZIA_VERSION = 'PC-2.6'
 
 # File di log (nella stessa cartella del bot)
 # L'output viene scritto sia a video che nel file di log

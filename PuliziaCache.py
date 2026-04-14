@@ -1,9 +1,29 @@
 #!/usr/bin/env python3
 """
 PuliziaCache.py - Script di pulizia cache VociRecenti
-Versione PC-2.2
+Versione PC-2.6
 
 Changelog:
+- PC-2.6: FIX _fetch_wikitext_for_titles: corretto accesso al wikitext dalla
+          risposta API rvslots=main: il campo e' "slots.main.*" non "slots.main.content".
+          Senza questo fix il wikitext era sempre vuoto -> templates=[] e preview=""
+          per tutte le voci.
+- PC-2.5: FIX _fetch_categories_for_titles: aggiunto loop su batch da BATCH_SIZE
+          titoli (MediaWiki accetta max 50 titoli/chiamata). Senza questo fix
+          su 2895 voci venivano recuperate le categorie solo dei primi 50 titoli,
+          lasciando cats=[] per tutte le altre -> nessun aggiornamento reale.
+- PC-2.4: Aggiunto DRY_RUN mode (DRY_RUN = True): esegue tutte le fasi e
+          tutte le chiamate API ma non salva nulla su Wikipedia. Al termine
+          stampa un report diagnostico con dimensione stimata, campione delle
+          prime voci, e statistiche aggregate (media cat/tmpl/voce, % preview
+          vuote) per rilevare corruzioni prima che avvengano.
+- PC-2.3: remove_deleted_pages ottimizzata: FASE 1 e FASE 2 collassate in un
+          unico ciclo batch tramite la nuova check_and_update_pages_batch.
+          Ogni batch da 50 titoli usa prop=info|categories|revisions per ottenere
+          in una sola chiamata API: flag missing/redirect/NS, categorie complete
+          (cllimit=500, con gestione paginazione clcontinue), wikitext per
+          template e preview. Riduzione chiamate da ~3000 singole a ~60 batch.
+          Rimossa la vecchia check_pages_batch (sostituita).
 - PC-2.2: format_lua_data: aggiunto flag '-- tz=IT' nell'intestazione dei file
           Lua generati e aggiornata dicitura da 'UTC' a 'ora italiana', in linea
           con il bot v8.38 che scrive i timestamp in ora italiana (CET/CEST).
@@ -40,7 +60,7 @@ Changelog:
 Funzioni:
 1. Rimuove duplicati
 2. Rimuove voci non in NS0
-3. Rimuove voci cancellate/non esistenti
+3. Rimuove voci cancellate/non esistenti; aggiorna metadati modificati
 4. Rimuove voci con eta' effettiva > MAX_AGE_DAYS giorni fa
    (usa move_timestamp se presente, altrimenti timestamp di creazione)
 """
@@ -54,7 +74,7 @@ from datetime import datetime, timedelta
 # ========================================
 # CONFIGURAZIONE
 # ========================================
-VERSION = 'PC-2.2'
+VERSION = 'PC-2.6'
 MAX_PAGES = 3000
 MAX_CHARS_PER_FILE = 1500000
 DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
@@ -65,8 +85,11 @@ REMOVE_DELETED = True
 REMOVE_REDIRECTS = True
 REMOVE_WRONG_NAMESPACE = True
 REMOVE_TOO_OLD = True                      # Rimuovi voci troppo vecchie
+BATCH_SIZE = 50                            # Titoli per chiamata API batch
 DATA_DIR = '/data/project/botvocirecenti/botvocirecenti'
 LOG_FILE = os.path.join(DATA_DIR, 'pulizia_cache.log')
+DRY_RUN = False   # Se True: esegue tutto ma NON salva su Wikipedia.
+                 # Impostare False solo dopo aver verificato il report diagnostico.
 # ========================================
 
 
@@ -92,14 +115,123 @@ def log_only(msg):
 
 
 
+def dry_run_report(pages):
+    """
+    Stampa un report diagnostico completo senza salvare nulla.
+    Rileva corruzioni (campi vuoti, dimensione anomala) prima che avvengano.
+    """
+    n = len(pages)
+    if n == 0:
+        print("  Nessuna voce da analizzare.")
+        return
+
+    # ---- Statistiche aggregate ----
+    total_cats = sum(len(p.get('categorie', [])) for p in pages)
+    total_tmpls = sum(len(p.get('templates', [])) for p in pages)
+    total_preview_len = sum(len(p.get('preview', '')) for p in pages)
+    voci_no_cats = sum(1 for p in pages if not p.get('categorie'))
+    voci_no_tmpls = sum(1 for p in pages if not p.get('templates'))
+    voci_no_preview = sum(1 for p in pages if not p.get('preview', '').strip())
+
+    avg_cats = total_cats / n
+    avg_tmpls = total_tmpls / n
+    avg_preview = total_preview_len / n
+
+    # ---- Dimensione stimata ----
+    file_groups = split_pages_into_files(pages)
+    total_size_bytes = 0
+    for group in file_groups:
+        for p in group:
+            try:
+                total_size_bytes += len(format_lua_row(p).encode('utf-8'))
+            except Exception:
+                pass
+    size_mb = total_size_bytes / (1024 * 1024)
+
+    # ---- Soglie di allarme ----
+    # Una cache sana su it.wiki ha mediamente almeno 2-3 categorie e 1 template per voce
+    WARN_AVG_CATS   = 1.0
+    WARN_AVG_TMPLS  = 0.5
+    WARN_NO_CATS_PCT = 50.0   # % massima voci senza categorie
+    WARN_NO_TMPLS_PCT = 70.0  # % massima voci senza template (molte voci stub ne hanno pochi)
+    WARN_NO_PREV_PCT = 80.0   # % massima voci senza preview
+    WARN_SIZE_MB    = 0.5     # soglia minima dimensione stimata (MB)
+
+    alerts = []
+    if avg_cats < WARN_AVG_CATS:
+        alerts.append(f"  *** ALLARME: media categorie/voce troppo bassa ({avg_cats:.2f} < {WARN_AVG_CATS})")
+    if avg_tmpls < WARN_AVG_TMPLS:
+        alerts.append(f"  *** ALLARME: media template/voce troppo bassa ({avg_tmpls:.2f} < {WARN_AVG_TMPLS})")
+    if (voci_no_cats / n * 100) > WARN_NO_CATS_PCT:
+        alerts.append(f"  *** ALLARME: {voci_no_cats}/{n} voci ({voci_no_cats/n*100:.1f}%) senza categorie")
+    if (voci_no_tmpls / n * 100) > WARN_NO_TMPLS_PCT:
+        alerts.append(f"  *** ALLARME: {voci_no_tmpls}/{n} voci ({voci_no_tmpls/n*100:.1f}%) senza template")
+    if (voci_no_preview / n * 100) > WARN_NO_PREV_PCT:
+        alerts.append(f"  *** ALLARME: {voci_no_preview}/{n} voci ({voci_no_preview/n*100:.1f}%) senza preview")
+    if size_mb < WARN_SIZE_MB:
+        alerts.append(f"  *** ALLARME: dimensione stimata troppo piccola ({size_mb:.2f} MB < {WARN_SIZE_MB} MB)")
+
+    print(f"Statistiche aggregate ({n} voci):")
+    print(f"  Dimensione stimata output:  {size_mb:.2f} MB ({len(file_groups)} file)")
+    print(f"  Media categorie/voce:       {avg_cats:.2f}  "
+          f"(voci senza categorie: {voci_no_cats}/{n} = {voci_no_cats/n*100:.1f}%)")
+    print(f"  Media template/voce:        {avg_tmpls:.2f}  "
+          f"(voci senza template:  {voci_no_tmpls}/{n} = {voci_no_tmpls/n*100:.1f}%)")
+    print(f"  Media lunghezza preview:    {avg_preview:.0f} car  "
+          f"(voci senza preview:   {voci_no_preview}/{n} = {voci_no_preview/n*100:.1f}%)")
+
+    # ---- Campione prime 10 voci ----
+    print(f"\nCampione prime 10 voci:")
+    print(f"  {'Titolo':<45} {'Timestamp':<15} {'Cat':>4} {'Tmpl':>5} {'Prev':>5}")
+    print(f"  {'-'*45} {'-'*15} {'-'*4} {'-'*5} {'-'*5}")
+    for p in pages[:10]:
+        titolo = p.get('titolo', '')[:44]
+        ts = p.get('timestamp', '')
+        nc = len(p.get('categorie', []))
+        nt = len(p.get('templates', []))
+        np_ = len(p.get('preview', ''))
+        print(f"  {titolo:<45} {ts:<15} {nc:>4} {nt:>5} {np_:>5}")
+
+    # ---- Campione 10 voci peggiori (meno dati) ----
+    worst = sorted(pages, key=lambda p: (
+        len(p.get('categorie', [])) + len(p.get('templates', [])) + len(p.get('preview', ''))
+    ))[:10]
+    print(f"\nCampione 10 voci con meno dati (potenziali corruzioni):")
+    print(f"  {'Titolo':<45} {'Timestamp':<15} {'Cat':>4} {'Tmpl':>5} {'Prev':>5}")
+    print(f"  {'-'*45} {'-'*15} {'-'*4} {'-'*5} {'-'*5}")
+    for p in worst:
+        titolo = p.get('titolo', '')[:44]
+        ts = p.get('timestamp', '')
+        nc = len(p.get('categorie', []))
+        nt = len(p.get('templates', []))
+        np_ = len(p.get('preview', ''))
+        print(f"  {titolo:<45} {ts:<15} {nc:>4} {nt:>5} {np_:>5}")
+
+    # ---- Allarmi ----
+    if alerts:
+        print(f"\n{'!' * 60}")
+        print("ATTENZIONE - RILEVATI PROBLEMI:")
+        for a in alerts:
+            print(a)
+        print("NON eseguire con DRY_RUN=False finche' i problemi non sono risolti.")
+        print(f"{'!' * 60}")
+    else:
+        print(f"\nOK - Nessun allarme rilevato. I dati sembrano integri.")
+        print(f"Per salvare su Wikipedia: impostare DRY_RUN = False e rieseguire.")
+
+
 def main():
     global _log_file
     _log_file = open(LOG_FILE, 'a', encoding='utf-8')
     start_time = datetime.now()
+    dry_tag = " [DRY-RUN]" if DRY_RUN else ""
     log(f"\n{'=' * 60}")
-    log(f"PULIZIA CACHE VOCI RECENTI - {VERSION}")
+    log(f"PULIZIA CACHE VOCI RECENTI - {VERSION}{dry_tag}")
     log(f"Avvio: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     log('=' * 60)
+
+    if DRY_RUN:
+        print("*** MODALITA' DRY-RUN: nessuna modifica verra' salvata su Wikipedia ***\n")
 
     print("\nLogin come BotVociRecenti...")
     if not SITE.logged_in():
@@ -128,7 +260,7 @@ def main():
     cached_pages, removed_wrong_ns = remove_wrong_namespace(cached_pages)
 
     print("\n" + "=" * 60)
-    print("FASE 3: RIMOZIONE VOCI CANCELLATE")
+    print("FASE 3: RIMOZIONE VOCI CANCELLATE / AGGIORNAMENTO METADATI")
     print("=" * 60)
     cached_pages, removed_deleted = remove_deleted_pages(cached_pages)
 
@@ -155,9 +287,15 @@ def main():
         print("(eventuali aggiornamenti metadati sono stati salvati sopra)")
 
     print("\n" + "=" * 60)
-    print("SALVATAGGIO CACHE PULITA")
-    print("=" * 60)
-    save_cache(cached_pages, cache_files)
+    if DRY_RUN:
+        print("REPORT DIAGNOSTICO [DRY-RUN]")
+        print("=" * 60)
+        dry_run_report(cached_pages)
+        print("\n*** DRY-RUN completato: nessun file e' stato modificato su Wikipedia ***")
+    else:
+        print("SALVATAGGIO CACHE PULITA")
+        print("=" * 60)
+        save_cache(cached_pages, cache_files)
 
     print("\n" + "=" * 60)
     print("COMPLETATO!")
@@ -165,7 +303,7 @@ def main():
 
     end_time = datetime.now()
     log_only(f"\nFine: {end_time.strftime('%Y-%m-%d %H:%M:%S')} "
-             f"(durata: {(end_time - start_time).seconds}s)")
+             f"(durata: {(end_time - start_time).seconds}s){dry_tag}")
     log_only(f"Riepilogo: originali={original_count}, rimosse={total_removed}, "
              f"finali={len(cached_pages)}")
     log_only('=' * 60)
@@ -650,144 +788,287 @@ def remove_wrong_namespace(pages):
     return valid_pages, removed
 
 
-def check_pages_batch(pages):
+def _fetch_categories_for_titles(titles):
     """
-    Verifica via API batch (50 titoli/chiamata, senza seguire redirect)
-    quali voci sono cancellate, redirect o fuori NS0.
-    Restituisce un dict titolo -> motivo per le voci da rimuovere.
+    Scarica le categorie complete per una lista di titoli tramite API batch.
+    Itera su batch da BATCH_SIZE titoli (MediaWiki accetta max 50 titoli per
+    chiamata). Per ogni batch gestisce la paginazione con clcontinue per pagine
+    con >500 categorie (raro su it.wiki ma gestito correttamente).
+    Restituisce un dict {titolo_originale: [lista categorie]}.
     """
-    BATCH = 50
-    titles = [p['titolo'] for p in pages]
-    to_remove = {}
-    n = len(titles)
+    cats_by_title = {t: [] for t in titles}
 
-    print(f"  Verifica batch {n} voci ({BATCH} titoli/chiamata)...")
+    for batch_start in range(0, len(titles), BATCH_SIZE):
+        batch = titles[batch_start:batch_start + BATCH_SIZE]
+        norm_to_orig = {}
 
-    for start in range(0, n, BATCH):
-        batch = titles[start:start + BATCH]
+        params = {
+            'action': 'query',
+            'prop': 'categories',
+            'titles': '|'.join(batch),
+            'cllimit': '500',
+            'clshow': '!hidden',
+            'format': 'json',
+        }
+
+        while True:
+            try:
+                result = SITE.simple_request(**params).submit()
+            except Exception as e:
+                log_only(f"  WARNING _fetch_categories batch [{batch_start//BATCH_SIZE + 1}]: {e}")
+                break
+
+            query_data = result.get('query', {})
+
+            # Costruisci mappa normalizzazioni al primo giro del batch
+            if not norm_to_orig:
+                for n in query_data.get('normalized', []):
+                    norm_to_orig[n['to']] = n['from']
+
+            pages_info = query_data.get('pages', {})
+            for page_id, page_info in pages_info.items():
+                if page_id == '-1' or 'missing' in page_info:
+                    continue
+                title_norm = page_info.get('title', '')
+                orig = norm_to_orig.get(title_norm, title_norm)
+                key = orig if orig in cats_by_title else title_norm
+                if key not in cats_by_title:
+                    continue
+                for cat in page_info.get('categories', []):
+                    cat_title = cat.get('title', '')
+                    if ':' in cat_title:
+                        cat_title = cat_title.split(':', 1)[1]
+                    if cat_title and cat_title not in cats_by_title[key]:
+                        cats_by_title[key].append(cat_title)
+
+            # Paginazione clcontinue per questo batch
+            cont = result.get('query-continue', {}).get('categories', {})
+            if not cont:
+                cont = result.get('continue', {})
+                clcontinue = cont.get('clcontinue', '')
+            else:
+                clcontinue = cont.get('clcontinue', '')
+
+            if clcontinue:
+                params['clcontinue'] = clcontinue
+            else:
+                break
+
+    return cats_by_title
+
+
+def _fetch_wikitext_for_titles(titles):
+    """
+    Scarica il wikitext per una lista di titoli tramite API batch.
+    Usa batch piccoli (BATCH_SIZE_REV titoli) per evitare che MediaWiki
+    tronchi silenziosamente le revisions su pagine grandi.
+    Restituisce un dict {titolo_originale: wikitext}.
+    """
+    BATCH_SIZE_REV = 10  # batch piccolo: wikitext puo' essere molto grande
+    wikitext_by_title = {}
+
+    for start in range(0, len(titles), BATCH_SIZE_REV):
+        batch = titles[start:start + BATCH_SIZE_REV]
         try:
-            query = SITE.simple_request(
+            result = SITE.simple_request(
+                action='query',
+                prop='revisions',
+                titles='|'.join(batch),
+                rvprop='content',
+                rvslots='main',
+                format='json',
+            ).submit()
+        except Exception as e:
+            log_only(f"  WARNING _fetch_wikitext batch: {e}")
+            continue
+
+        query_data = result.get('query', {})
+        inv_norm = {n_entry['to']: n_entry['from']
+                    for n_entry in query_data.get('normalized', [])}
+
+        for page_id, page_info in query_data.get('pages', {}).items():
+            if page_id == '-1' or 'missing' in page_info:
+                continue
+            title_result = page_info.get('title', '')
+            orig_title = inv_norm.get(title_result, title_result)
+
+            wikitext = ''
+            try:
+                revisions = page_info.get('revisions', [])
+                if revisions:
+                    slots = revisions[0].get('slots', {})
+                    if slots:
+                        wikitext = slots.get('main', {}).get('*', '')
+                    else:
+                        wikitext = revisions[0].get('*', '')
+            except Exception:
+                pass
+
+            wikitext_by_title[orig_title] = wikitext
+
+    return wikitext_by_title
+
+
+def check_and_update_pages_batch(pages):
+    """
+    Verifica e aggiorna i metadati di tutte le voci in cache tramite API batch.
+    Tre chiamate separate per batch:
+      1. prop=info (BATCH_SIZE=50): rilevamento missing/redirect/NS
+      2. prop=categories (BATCH_SIZE=50, con paginazione): categorie visibili
+      3. prop=revisions (BATCH_SIZE_REV=10): wikitext per template e preview
+         Batch piccolo necessario: MediaWiki tronca silenziosamente le revisions
+         quando la risposta supera i limiti di dimensione.
+
+    Per ogni voce sopravvissuta: confronta categorie e template con i dati
+    in cache; se cambiati aggiorna il record e logga le differenze.
+
+    Restituisce (valid_pages, removed_count).
+    """
+    n = len(pages)
+    to_remove = {}       # titolo -> motivo
+    updated_records = {} # titolo -> record aggiornato
+
+    print(f"  Verifica e aggiornamento batch {n} voci "
+          f"(info:{BATCH_SIZE} titoli/chiamata, rev:10 titoli/chiamata)...")
+
+    # ========================================================
+    # PASSATA 1: prop=info — rilevamento rimozioni
+    # ========================================================
+    # Mappa normalizzazioni costruita durante la passata info
+    all_normalized = {}   # titolo_originale -> titolo_normalizzato
+    all_inv_norm = {}     # titolo_normalizzato -> titolo_originale
+    survivor_titles = []  # titoli sopravvissuti in ordine
+
+    for start in range(0, n, BATCH_SIZE):
+        batch = pages[start:start + BATCH_SIZE]
+        batch_titles = [p['titolo'] for p in batch]
+        done = min(start + BATCH_SIZE, n)
+
+        if done % 500 == 0 or done == n:
+            print(f"  [{done}/{n}] Info: {len(to_remove)} rimosse...")
+
+        try:
+            result = SITE.simple_request(
                 action='query',
                 prop='info',
-                titles='|'.join(batch),
-                inprop=''
-                # NB: redirects=True NON viene passato: cosi' MediaWiki restituisce
-                # le info sulla pagina stessa, incluso il flag 'redirect' se e' un redirect.
-            )
-            result = query.submit()
-            query_data = result.get('query', {})
-            pages_info = query_data.get('pages', {})
-
-            # Mappa normalizzazioni (maiuscole/minuscole ecc.)
-            normalized = {n['from']: n['to'] for n in query_data.get('normalized', [])}
-            # Mappa inversa: da titolo normalizzato a titolo originale
-            inv_norm = {v: k for k, v in normalized.items()}
-
-            for page_id, page_info in pages_info.items():
-                title_result = page_info.get('title', '')
-                orig_title = inv_norm.get(title_result, title_result)
-
-                if page_id == '-1' or 'missing' in page_info:
-                    to_remove[orig_title] = 'cancellata'
-                elif 'redirect' in page_info:
-                    to_remove[orig_title] = 'redirect'
-                elif page_info.get('ns', 0) != 0:
-                    to_remove[orig_title] = f"NS{page_info.get('ns', '?')}"
-
+                titles='|'.join(batch_titles),
+                inprop='',
+                format='json',
+            ).submit()
         except Exception as e:
-            print(f"  WARNING batch [{start//BATCH + 1}]: {e}")
+            log_only(f"  WARNING batch info [{start//BATCH_SIZE + 1}]: {e}")
+            # In caso di errore conserva tutte le voci del batch
+            survivor_titles.extend(batch_titles)
+            continue
 
-        done = min(start + BATCH, n)
-        if done % 500 == 0 or done == n:
-            print(f"  [{done}/{n}] Verifica batch...")
+        query_data = result.get('query', {})
+        for n_entry in query_data.get('normalized', []):
+            all_normalized[n_entry['from']] = n_entry['to']
+            all_inv_norm[n_entry['to']] = n_entry['from']
 
-    return to_remove
+        for page_id, page_info in query_data.get('pages', {}).items():
+            title_result = page_info.get('title', '')
+            orig_title = all_inv_norm.get(title_result, title_result)
+
+            if page_id == '-1' or 'missing' in page_info:
+                to_remove[orig_title] = 'cancellata'
+                log_only(f"  RIMOSSA (cancellata): {orig_title}")
+            elif 'redirect' in page_info:
+                to_remove[orig_title] = 'redirect'
+                log_only(f"  RIMOSSA (redirect): {orig_title}")
+            elif page_info.get('ns', 0) != 0:
+                to_remove[orig_title] = f"NS{page_info.get('ns', '?')}"
+                log_only(f"  RIMOSSA (NS{page_info.get('ns','?')}): {orig_title}")
+            else:
+                survivor_titles.append(orig_title)
+
+    print(f"  Sopravvissute: {len(survivor_titles)}, rimosse: {len(to_remove)}")
+
+    # ========================================================
+    # PASSATA 2: prop=categories — categorie per sopravvissuti
+    # ========================================================
+    print(f"  Recupero categorie per {len(survivor_titles)} voci...")
+    cats_by_title = _fetch_categories_for_titles(survivor_titles)
+
+    # ========================================================
+    # PASSATA 3: prop=revisions — wikitext per sopravvissuti
+    # ========================================================
+    print(f"  Recupero wikitext per {len(survivor_titles)} voci (10 titoli/chiamata)...")
+    wikitext_by_title = _fetch_wikitext_for_titles(survivor_titles)
+
+    # ========================================================
+    # CONFRONTO e aggiornamento record
+    # ========================================================
+    batch_by_title = {p['titolo']: p for p in pages}
+
+    for orig_title in survivor_titles:
+        record = batch_by_title.get(orig_title)
+        if record is None:
+            # Prova con titolo normalizzato (raro)
+            norm_title = all_normalized.get(orig_title, orig_title)
+            record = batch_by_title.get(norm_title)
+        if record is None:
+            continue
+
+        wikitext = wikitext_by_title.get(orig_title, '')
+        new_cats = cats_by_title.get(orig_title, [])
+        new_templates = parse_templates_from_wikitext(wikitext)
+        new_preview = wikitext[:100].replace('\n', ' ').strip() if wikitext else ''
+
+        old_cats = record.get('categorie', [])
+        old_templates = record.get('templates', [])
+
+        cats_changed = set(new_cats) != set(old_cats)
+        old_tmpl_set = {(t.get('nome', ''), tuple(t.get('params', [])))
+                        for t in old_templates}
+        new_tmpl_set = {(t.get('nome', ''), tuple(t.get('params', [])))
+                        for t in new_templates}
+        tmpls_changed = old_tmpl_set != new_tmpl_set
+
+        if cats_changed or tmpls_changed:
+            updated = dict(record)
+            updated['categorie'] = new_cats
+            updated['templates'] = new_templates
+            updated['preview'] = new_preview
+            updated_records[orig_title] = updated
+
+            changes = []
+            if cats_changed:
+                changes.append('categorie')
+            if tmpls_changed:
+                changes.append('template')
+            log_only(f"  AGGIORNATA ({', '.join(changes)}): {orig_title}")
+            if tmpls_changed:
+                removed_t = old_tmpl_set - new_tmpl_set
+                added_t   = new_tmpl_set - old_tmpl_set
+                for nome, params in sorted(removed_t):
+                    log_only(f"    TMPL RIMOSSO:   {nome}  params={list(params)}")
+                for nome, params in sorted(added_t):
+                    log_only(f"    TMPL AGGIUNTO:  {nome}  params={list(params)}")
+
+    # ---- Costruzione lista finale ----
+    removed_count = len(to_remove)
+    valid_pages = []
+    for page in pages:
+        title = page['titolo']
+        if title in to_remove:
+            continue
+        if title in updated_records:
+            valid_pages.append(updated_records[title])
+        else:
+            valid_pages.append(page)
+
+    print(f"\nRisultato: {removed_count} voci rimosse, {len(updated_records)} voci aggiornate")
+    return valid_pages, removed_count
 
 
 def remove_deleted_pages(pages):
     """
-    Rimuove voci cancellate, redirect o fuori NS0 tramite query API batch.
-    Per le voci sopravvissute aggiorna i metadati (categorie, template, preview)
-    solo se cambiati, con chiamate singole.
+    Rimuove voci cancellate, redirect o fuori NS0; aggiorna metadati modificati.
+    Delega interamente a check_and_update_pages_batch che gestisce tutto in batch.
     """
-    print("Verifica esistenza e aggiornamento metadati...")
-
-    # FASE 1: verifica batch
-    to_remove = check_pages_batch(pages)
-    removed = len(to_remove)
-    for title, reason in to_remove.items():
-        log_only(f"  RIMOSSA ({reason}): {title}")
-
-    # FASE 2: aggiornamento metadati per le voci sopravvissute
-    surviving = [p for p in pages if p['titolo'] not in to_remove]
-    updated = 0
-    valid_pages = []
-    total = len(surviving)
-
-    print(f"  Aggiornamento metadati {total} voci sopravvissute...")
-
-    for i, page in enumerate(surviving):
-        if (i + 1) % 50 == 0:
-            print(f"  Aggiornate: {i+1}/{total}, modificate: {updated}")
-
-        title = page['titolo']
-
-        try:
-            page_obj = pywikibot.Page(SITE, title, ns=0)
-
-            # Rileggi metadati
-            try:
-                new_cats = [cat.title(with_ns=False) for cat in page_obj.categories()]
-            except Exception:
-                new_cats = page.get('categorie', [])
-
-            try:
-                wikitext = page_obj.text
-                new_templates = parse_templates_from_wikitext(wikitext)
-                new_preview = wikitext[:100].replace('\n', ' ').strip() if wikitext else ''
-            except Exception:
-                new_templates = page.get('templates', [])
-                new_preview = page.get('preview', '')
-
-            # Confronta con i dati in cache
-            old_cats = page.get('categorie', [])
-            old_templates = page.get('templates', [])
-
-            cats_changed = set(new_cats) != set(old_cats)
-            old_tmpl_set = {(t.get('nome',''), tuple(t.get('params',[]))) for t in old_templates}
-            new_tmpl_set = {(t.get('nome',''), tuple(t.get('params',[]))) for t in new_templates}
-            tmpls_changed = old_tmpl_set != new_tmpl_set
-
-            if cats_changed or tmpls_changed:
-                page = dict(page)
-                page['categorie'] = new_cats
-                page['templates'] = new_templates
-                page['preview'] = new_preview
-                updated += 1
-                changes = []
-                if cats_changed:
-                    changes.append('categorie')
-                if tmpls_changed:
-                    changes.append('template')
-                msg = f"  AGGIORNATA ({', '.join(changes)}): {title}"
-                log_only(msg)
-                if tmpls_changed:
-                    removed_t = old_tmpl_set - new_tmpl_set
-                    added_t   = new_tmpl_set - old_tmpl_set
-                    for nome, params in sorted(removed_t):
-                        log_only(f"    TMPL RIMOSSO:   {nome}  params={list(params)}")
-                    for nome, params in sorted(added_t):
-                        log_only(f"    TMPL AGGIUNTO:  {nome}  params={list(params)}")
-
-            valid_pages.append(page)
-
-        except Exception as e:
-            removed += 1
-            log_only(f"  RIMOSSA (errore): {title} - {e}")
-            continue
-
-    print(f"\nRisultato: {removed} voci rimosse, {updated} voci aggiornate")
-    return valid_pages, removed
+    print(f"Verifica esistenza e aggiornamento metadati ({len(pages)} voci)...")
+    return check_and_update_pages_batch(pages)
 
 
 def remove_old_pages(pages, cutoff_date):
