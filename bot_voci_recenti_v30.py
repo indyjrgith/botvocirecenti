@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v8.44
+Bot VociRecenti v8.45
 
 Changelog:
+- v.8.45: Per ricreazioni e spostamenti usa rc_ts_it/move_ts come timestamp in cache,
+     non oldest_revision che punterebbe alla versione storica (es. redirect di anni fa)
 - v8.44: FIX confronto UTC vs IT in get_new_creations_since_cutoff e
          scan_other_namespaces: rc_ts proveniente dall'API MediaWiki e' in UTC
          grezzo, ma cutoff_str e' generato da now_it() in ora italiana (CEST +2).
@@ -275,7 +277,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '8.43'
+VERSION = '8.45'
 MAX_AGE_DAYS = 30       
 config.put_throttle = 1
 config.minthrottle = 0
@@ -1843,12 +1845,15 @@ def download_page_data(titles, existing_titles, cutoff_date, moves_cache=None, m
             # altrimenti usa la data di creazione originale
             move_ts_str = move_timestamps.get(title) if move_timestamps else None
             if move_ts_str:
-                try:
-                    ref_date = datetime.strptime(move_ts_str, '%Y%m%d%H%M%S')
-                except Exception:
-                    ref_date = created.replace(tzinfo=None)
-            else:
-                ref_date = created.replace(tzinfo=None)
+    try:
+        ref_date = datetime.strptime(move_ts_str, '%Y%m%d%H%M%S')
+    except Exception:
+        ref_date = created.replace(tzinfo=None)
+    # Per ricreazioni e spostamenti usa rc_ts_it/move_ts come timestamp in cache,
+    # non oldest_revision che punterebbe alla versione storica (es. redirect di anni fa)
+    timestamp = move_ts_str
+else:
+    ref_date = created.replace(tzinfo=None)
 
             if ref_date < cutoff_date:
                 skipped_old.append(title)
