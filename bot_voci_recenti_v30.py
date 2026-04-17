@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.1.1
+Bot VociRecenti v9.1.2
 
 Changelog:
+- v9.1.2: FIX ordinamento STEP 6: le voci spostate da altro namespace non venivano
+          piu' visualizzate una volta raggiunto il limite MAX_PAGES.
+          Il problema era nell'ordinamento che usava solo 'timestamp' (data di prima
+          creazione): voci create mesi fa ma spostate di recente finivano in fondo alla
+          lista e venivano tagliate dal troncamento a MAX_PAGES.
+          L'ordinamento ora usa la stessa logica gia' presente nel filtro per eta':
+          move_timestamp se presente, altrimenti timestamp. Cosi' una voce creata a
+          luglio 2025 ma spostata ieri scala in cima e non viene eliminata.
+- v9.1.1: (precedente)
 - v9.1: FIX doppia scrittura su Wikipedia: rimossa la chiamata a _cleanup_save_cache
         da run_cleanup_internal (che ora restituisce solo i dati puliti senza scrivere).
         Il salvataggio avviene una sola volta in STEP 7, come previsto dalla fusione v9.0.
@@ -147,7 +156,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.1'
+VERSION = '9.1.2'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -2751,7 +2760,10 @@ def main():
             print(f"  Dedup: {len(all_pages) - len(deduped)} duplicati rimossi (record aggiornati mantenuti)")
         all_pages = deduped
 
-    all_pages.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+    all_pages.sort(
+        key=lambda x: x.get('move_timestamp') or x.get('timestamp', ''),
+        reverse=True
+    )
     all_pages = all_pages[:MAX_PAGES]
 
     rimosse = len(new_pages) + len(cached_pages) - len(all_pages)
