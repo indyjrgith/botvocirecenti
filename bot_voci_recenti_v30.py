@@ -141,7 +141,7 @@ def now_it():
 # ========================================
 # CONFIGURAZIONE
 # ========================================
-MAX_PAGES = 3200                            # Totale voci da mantenere
+MAX_PAGES = 3500                            # Totale voci da mantenere
 MAX_CHARS_PER_FILE = 1500000               # ~1.5MB per file
 DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
