@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.1.2
+Bot VociRecenti v9.2
 
 Changelog:
+- v9.2: Distinzione categorie visibili / nascoste.
+        _cleanup_fetch_categories_for_titles ora usa clprop=hidden (zero chiamate
+        API aggiuntive: e' un campo extra nella risposta esistente) e restituisce
+        dict {titolo: {'visible': [...], 'hidden': [...]}} invece di una lista piatta.
+        Il 7° campo del formato Lua posizionale contiene le categorie nascoste:
+          {titolo, timestamp, {cat_visibili}, {templates}, preview, move_ts, {cat_nascoste}}
+        parse_single_voce legge il 7° campo con fallback {} per cache vecchie (v9.1.x).
+        Il campo Python corrispondente e' 'categorie_nascoste'.
+        Lato Lua (Modulo:VociRecenti v8.40): i parametri HAndCat, HOrCat, HNoCat
+        operano sulle categorie nascoste (voce[7]); tutti gli altri parametri
+        (AndCat, OrCat, NoCat, NoCat=*) operano solo sulle visibili (voce[3]).
 - v9.1.2: FIX ordinamento STEP 6: le voci spostate da altro namespace non venivano
           piu' visualizzate una volta raggiunto il limite MAX_PAGES.
           Il problema era nell'ordinamento che usava solo 'timestamp' (data di prima
@@ -156,7 +167,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.1.2'
+VERSION = '9.2'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -703,10 +714,29 @@ def parse_single_voce(block):
         if not move_timestamp:
             move_timestamp = ""
 
+        # 7° campo: categorie nascoste (introdotto in v9.2 — fallback {} per cache vecchie)
+        while pos < len(block) and block[pos] in ' \t\n\r,':
+            pos += 1
+        categorie_nascoste = []
+        if pos < len(block) and block[pos] == '{':
+            hcat_end = find_balanced_braces(block, pos)
+            if hcat_end is not None:
+                hcat_block = block[pos+1:hcat_end]
+                hcp = 0
+                while hcp < len(hcat_block):
+                    val, new_hcp = extract_lua_longstring(hcat_block, hcp)
+                    if val is not None:
+                        categorie_nascoste.append(val)
+                        hcp = new_hcp
+                    else:
+                        hcp += 1
+                pos = hcat_end + 1
+
         record = {
             'titolo': titolo,
             'timestamp': timestamp,
             'categorie': categorie,
+            'categorie_nascoste': categorie_nascoste,
             'templates': templates,
             'preview': preview
         }
@@ -912,11 +942,14 @@ def lua_str(s):
 
 def format_lua_row(page):
     """Formatta una singola voce in Lua (una riga del array d={}).
-    Struttura: {titolo, timestamp, {categorie}, {templates}, preview, move_timestamp}
+    Struttura: {titolo, timestamp, {categorie_visibili}, {templates}, preview, move_timestamp, {categorie_nascoste}}
     Il 6° campo move_timestamp e' una stringa vuota se non presente.
+    Il 7° campo categorie_nascoste e' sempre presente (lista vuota se assente).
     """
     cats = page.get('categorie', [])
     cats_lua = "{" + ",".join(lua_str(c) for c in cats) + "}"
+    hcats = page.get('categorie_nascoste', [])
+    hcats_lua = "{" + ",".join(lua_str(c) for c in hcats) + "}"
     tmpl_list = []
     for t in page.get('templates', []):
         nome = lua_str(t.get('nome', ''))
@@ -927,7 +960,7 @@ def format_lua_row(page):
     move_ts = lua_str(page.get('move_timestamp', ''))
     return (
         f"    {{{lua_str(page['titolo'])},{lua_str(page['timestamp'])},"
-        f"{cats_lua},{tmpls_lua},{preview},{move_ts}}}"
+        f"{cats_lua},{tmpls_lua},{preview},{move_ts},{hcats_lua}}}"
     )
 
 
@@ -1005,11 +1038,14 @@ def _cleanup_fetch_categories_for_titles(titles):
     """
     Scarica le categorie complete per una lista di titoli tramite API batch.
     Itera su batch da CLEANUP_BATCH_SIZE titoli. Per ogni batch gestisce la
-    paginazione con clcontinue. Restituisce dict {titolo: [lista categorie]}.
+    paginazione con clcontinue.
+    Usa clprop=hidden per distinguere categorie visibili e nascoste (zero
+    chiamate API aggiuntive: hidden e' un campo extra nella risposta esistente).
+    Restituisce dict {titolo: {'visible': [...], 'hidden': [...]}}.
     NON usa clshow=!hidden: le categorie delle disambigue sono nascoste e
     verrebbero silenziosamente scartate.
     """
-    cats_by_title = {t: [] for t in titles}
+    cats_by_title = {t: {'visible': [], 'hidden': []} for t in titles}
 
     for batch_start in range(0, len(titles), CLEANUP_BATCH_SIZE):
         batch = titles[batch_start:batch_start + CLEANUP_BATCH_SIZE]
@@ -1019,6 +1055,7 @@ def _cleanup_fetch_categories_for_titles(titles):
             'prop': 'categories',
             'titles': '|'.join(batch),
             'cllimit': '500',
+            'clprop': 'hidden',
             'format': 'json',
         }
         while True:
@@ -1043,8 +1080,12 @@ def _cleanup_fetch_categories_for_titles(titles):
                     cat_title = cat.get('title', '')
                     if ':' in cat_title:
                         cat_title = cat_title.split(':', 1)[1]
-                    if cat_title and cat_title not in cats_by_title[key]:
-                        cats_by_title[key].append(cat_title)
+                    if not cat_title:
+                        continue
+                    is_hidden = 'hidden' in cat
+                    bucket = 'hidden' if is_hidden else 'visible'
+                    if cat_title not in cats_by_title[key][bucket]:
+                        cats_by_title[key][bucket].append(cat_title)
             cont = result.get('query-continue', {}).get('categories', {})
             if not cont:
                 cont = result.get('continue', {})
@@ -1235,18 +1276,23 @@ def _cleanup_check_and_update_pages_batch(pages):
         creation_ts = rev_data.get('creation_ts', '')
 
         if orig_title in cats_by_title:
-            new_cats = cats_by_title[orig_title]
+            cat_data = cats_by_title[orig_title]
         else:
             norm_title = all_normalized.get(orig_title, orig_title)
-            new_cats = cats_by_title.get(norm_title, [])
+            cat_data = cats_by_title.get(norm_title, {'visible': [], 'hidden': []})
+
+        new_cats        = cat_data.get('visible', [])
+        new_cats_hidden = cat_data.get('hidden', [])
 
         new_templates = parse_templates_from_wikitext(wikitext)
         new_preview = wikitext[:100].replace('\n', ' ').strip() if wikitext else ''
 
-        old_cats = record.get('categorie', [])
-        old_templates = record.get('templates', [])
+        old_cats        = record.get('categorie', [])
+        old_cats_hidden = record.get('categorie_nascoste', [])
+        old_templates   = record.get('templates', [])
 
-        cats_changed = set(new_cats) != set(old_cats) or (not old_cats and bool(new_cats))
+        cats_changed = (set(new_cats) != set(old_cats) or (not old_cats and bool(new_cats))
+                        or set(new_cats_hidden) != set(old_cats_hidden))
         old_tmpl_set = {(t.get('nome', ''), tuple(t.get('params', []))) for t in old_templates}
         new_tmpl_set = {(t.get('nome', ''), tuple(t.get('params', []))) for t in new_templates}
         tmpls_changed = old_tmpl_set != new_tmpl_set
@@ -1255,7 +1301,8 @@ def _cleanup_check_and_update_pages_batch(pages):
 
         if cats_changed or tmpls_changed or ts_changed:
             updated = dict(record)
-            updated['categorie'] = new_cats
+            updated['categorie']         = new_cats
+            updated['categorie_nascoste'] = new_cats_hidden
             updated['templates'] = new_templates
             updated['preview'] = new_preview
             if ts_changed:
@@ -1777,7 +1824,8 @@ def download_page_data_batch(titles, existing_titles, cutoff_date, moves_cache=N
                 moves_cache[title] = {'processed_at': now_str, 'result': 'rejected', 'reason': 'too_old'}
             continue
 
-        categories = cats_by_title.get(title, [])
+        categories        = cats_by_title.get(title, {}).get('visible', [])
+        categories_hidden = cats_by_title.get(title, {}).get('hidden', [])
         templates = parse_templates_from_wikitext(wikitext)
         preview = wikitext[:100].replace("\n", " ").strip() if wikitext else ""
 
@@ -1785,6 +1833,7 @@ def download_page_data_batch(titles, existing_titles, cutoff_date, moves_cache=N
             'titolo': title,
             'timestamp': timestamp,
             'categorie': categories,
+            'categorie_nascoste': categories_hidden,
             'templates': templates,
             'preview': preview
         }
