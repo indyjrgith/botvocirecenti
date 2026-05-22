@@ -1,8 +1,29 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.2
+Bot VociRecenti v9.3
 
 Changelog:
+- v9.3: FIX rilevamento rinominazioni NS0->NS0.
+        In precedenza, spostamenti dove sia sorgente che destinazione erano in NS0
+        venivano scartati immediatamente per evitare di includere voci vecchie
+        rinominate di recente. Questo causava il mancato rilevamento di voci
+        rinominate mentre erano ancora nel range della cache.
+        Nuova logica: per ogni spostamento NS0->NS0 si risale la catena degli
+        spostamenti della voce (fino a 10 log, limite anti-loop) cercando il primo
+        ingresso in NS0 da un namespace diverso, oppure la data di creazione diretta.
+        Se tale evento originale rientra nel cutoff, la voce e' inclusa con:
+          - timestamp = data dell'evento originale (creazione o primo ingresso da NS!=0)
+          - move_timestamp = data della rinominazione recente NS0->NS0
+        Le voci NS0->NS0 il cui evento originale e' fuori dal cutoff vengono marcate
+        in moves_cache come 'ns0_to_ns0_old' per evitare la risalita nei run successivi.
+        Il costo API aggiuntivo e' trascurabile: al massimo 2 chiamate extra per voce
+        (logevents + revisions), e solo per voci NS0->NS0 nel range del cutoff.
+        Nuova funzione: _get_ns0_origin_timestamp(title).
+        Modifica: get_moved_to_ns0_since_cutoff ora accetta e restituisce anche
+        origin_timestamps (dict {titolo: ts_originale}) per le voci NS0->NS0 accettate.
+        Modifica: get_new_pages_only unpacca il nuovo valore di ritorno.
+        Modifica: download_page_data_batch accetta origin_timestamps opzionale e
+        lo usa per sovrascrivere creation_ts come timestamp del record.
 - v9.2: Distinzione categorie visibili / nascoste.
         _cleanup_fetch_categories_for_titles ora usa clprop=hidden (zero chiamate
         API aggiuntive: e' un campo extra nella risposta esistente) e restituisce
@@ -167,7 +188,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.2'
+VERSION = '9.3'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -1688,7 +1709,7 @@ def _batch_fetch_wikitext(titles):
     return _cleanup_fetch_wikitext_for_titles(titles)
 
 
-def download_page_data_batch(titles, existing_titles, cutoff_date, moves_cache=None, move_timestamps=None):
+def download_page_data_batch(titles, existing_titles, cutoff_date, moves_cache=None, move_timestamps=None, origin_timestamps=None):
     """
     Scarica i dati completi di una lista di titoli usando chiamate API batch.
     Sostituisce download_page_data (che usava chiamate singole per voce).
@@ -1700,7 +1721,11 @@ def download_page_data_batch(titles, existing_titles, cutoff_date, moves_cache=N
 
     Salta: duplicati, non esistenti, redirect, voci create prima di cutoff_date.
     Se moves_cache e' fornito, registra i rifiuti per evitare riverifiche nei run futuri.
-    move_timestamps: dict {titolo: move_ts_str} con timestamp di spostamento in NS0.
+    move_timestamps: dict {titolo: move_ts_str} con timestamp di spostamento recente in NS0.
+    origin_timestamps: dict {titolo: ts_str} con timestamp dell'evento originale per voci
+                       NS0->NS0; se presente, sovrascrive creation_ts come 'timestamp' del
+                       record (la data visibile nella lista e' quella dell'evento originale,
+                       non quella di prima creazione che coincide per le voci mai spostate).
     """
     if not titles:
         return []
@@ -1797,6 +1822,12 @@ def download_page_data_batch(titles, existing_titles, cutoff_date, moves_cache=N
             continue
 
         timestamp = creation_ts  # gia' in formato IT da _batch_fetch_wikitext
+
+        # Per le voci NS0->NS0 accettate, il timestamp visibile deve essere
+        # quello dell'evento originale (creazione in NS0 o primo ingresso da NS!=0),
+        # non la data di prima revisione che coincide con la creazione fisica.
+        if origin_timestamps and title in origin_timestamps:
+            timestamp = origin_timestamps[title]
 
         # Controllo eta'
         move_ts_str = move_timestamps.get(title) if move_timestamps else None
@@ -2245,15 +2276,16 @@ def get_new_pages_only(existing_titles, cutoff_date, moves_cache):
     print(f"  Trovate: {len(direct)} voci candidate ({len(recreation_timestamps)} ricreazioni)")
 
     print("\nFonte 2: Spostamenti in NS0 dal log...")
-    moved = get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache)
+    moved, origin_timestamps = get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache)
     candidate_titles.update(moved.keys())
     move_timestamps = {**recreation_timestamps, **moved}
-    print(f"  Trovate: {len(moved)} voci spostate")
+    print(f"  Trovate: {len(moved)} voci spostate ({len(origin_timestamps)} NS0->NS0 accettate)")
 
     print(f"\nTotale candidate NS0: {len(candidate_titles)}")
     print(f"Scaricamento dati completi (batch API)...")
     new_pages = download_page_data_batch(
-        list(candidate_titles), existing_titles, cutoff_date, moves_cache, move_timestamps)
+        list(candidate_titles), existing_titles, cutoff_date, moves_cache, move_timestamps,
+        origin_timestamps=origin_timestamps)
 
     print(f"\nOK Nuove voci da NS0: {len(new_pages)}\n")
     return new_pages
@@ -2332,14 +2364,102 @@ def get_new_creations_since_cutoff(existing_titles, cutoff_str):
     return found_titles, recreation_timestamps
 
 
+def _get_ns0_origin_timestamp(title, cutoff_date):
+    """
+    Per una voce che ha avuto uno spostamento NS0->NS0 recente, risale la catena
+    degli spostamenti (fino a MAX_NS0_CHAIN_DEPTH log) cercando il primo evento
+    "originale" che ha portato la voce in NS0:
+
+      1. Il primo spostamento dove il namespace sorgente era != 0  (es. Bozze->NS0)
+         -> restituisce (move_timestamp_IT, 'move')
+      2. Se non trovato: la data di creazione della pagina (prima revisione)
+         -> restituisce (creation_ts_IT, 'creation')
+
+    Restituisce (timestamp_str_IT, tipo) oppure (None, None) in caso di errore.
+    La chiamata e' limitata a MAX_NS0_CHAIN_DEPTH=10 log per limitare il costo API.
+    """
+    site = SITE
+    MAX_NS0_CHAIN_DEPTH = 10
+    try:
+        logs = list(site.logevents(
+            logtype='move',
+            page=title,
+            total=MAX_NS0_CHAIN_DEPTH
+        ))
+        # L'API restituisce dal piu' recente al piu' vecchio.
+        # Scorriamo cercando il PRIMO ingresso in NS0 da NS!=0
+        # (cioe' l'ultimo in ordine cronologico inverso che soddisfa la condizione).
+        origin_ts = None
+        origin_type = None
+        for log in logs:
+            try:
+                params = log.data.get('params', log.data)
+                # Il titolo sorgente e' la pagina del log stesso
+                src_page = log.page()
+                src_ns = int(src_page.namespace())
+                tgt_title = params.get('target_title', '')
+                tgt_page = pywikibot.Page(site, tgt_title) if tgt_title else None
+                tgt_ns = int(tgt_page.namespace()) if tgt_page else -1
+                if src_ns != 0 and tgt_ns == 0:
+                    # Trovato ingresso da NS!=0 -> questo e' l'evento originale
+                    origin_ts = ts_utc_to_it(log.timestamp())
+                    origin_type = 'move'
+                    # Non interrompiamo: vogliamo l'evento piu' vecchio (scorriamo tutto)
+            except Exception:
+                continue
+        if origin_ts is not None:
+            return origin_ts, origin_type
+
+        # Nessuno spostamento da NS!=0 trovato: la voce e' sempre stata in NS0.
+        # Usiamo la data di prima revisione (creazione diretta in NS0).
+        try:
+            params_rev = {
+                'action': 'query',
+                'prop': 'revisions',
+                'titles': title,
+                'rvprop': 'timestamp',
+                'rvdir': 'newer',
+                'rvlimit': '1',
+                'format': 'json',
+            }
+            data = site.simple_request(**params_rev).submit()
+            pages = data.get('query', {}).get('pages', {})
+            for page_data in pages.values():
+                revs = page_data.get('revisions', [])
+                if revs:
+                    ts_raw = revs[0].get('timestamp', '')
+                    ts_clean = ts_raw.replace('-','').replace('T','').replace(':','').replace('Z','')
+                    if ts_clean:
+                        try:
+                            dt_utc = datetime.strptime(ts_clean, '%Y%m%d%H%M%S')
+                            ts_it = (dt_utc + timedelta(hours=_it_offset_for_utc(dt_utc))).strftime('%Y%m%d%H%M%S')
+                            return ts_it, 'creation'
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    except Exception as e:
+        print(f"    _get_ns0_origin_timestamp({title}): errore: {e}")
+
+    return None, None
+
+
 def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
     """
-    Scorre il log degli spostamenti. Raccoglie solo destinazioni NS0
-    provenienti da namespace sorgente diverso da 0.
-    Restituisce dict {titolo_ns0: move_timestamp_str}.
+    Scorre il log degli spostamenti. Raccoglie destinazioni NS0:
+      - spostamenti NS!=0 -> NS0: inclusi direttamente
+      - spostamenti NS0 -> NS0 (rinominazioni): si risale la catena con
+        _get_ns0_origin_timestamp() per trovare l'evento originale; inclusi
+        solo se l'evento originale rientra nel cutoff.
+
+    Restituisce (found_titles, origin_timestamps) dove:
+      found_titles:    dict {titolo: move_ts_str_recente}
+      origin_timestamps: dict {titolo: ts_evento_originale} solo per NS0->NS0 accettati
     """
     site = SITE
     found_titles = {}
+    origin_timestamps = {}
     checked = 0
     skipped_cached = 0
     now_str = now_it().strftime('%Y%m%d%H%M%S')
@@ -2368,10 +2488,41 @@ def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
                     continue
                 source_page = log.page()
                 source_ns = int(source_page.namespace())
+
                 if source_ns == 0:
+                    # Spostamento NS0->NS0: risali la catena per trovare l'evento originale
+                    origin_ts, origin_type = _get_ns0_origin_timestamp(target_title, cutoff_date)
+                    if origin_ts is None:
+                        # Errore API: scarta cautelativamente
+                        moves_cache[target_title] = {
+                            'processed_at': now_str, 'result': 'rejected',
+                            'reason': 'ns0_to_ns0_api_error'}
+                        continue
+                    try:
+                        origin_dt = datetime.strptime(origin_ts, '%Y%m%d%H%M%S')
+                    except Exception:
+                        moves_cache[target_title] = {
+                            'processed_at': now_str, 'result': 'rejected',
+                            'reason': 'ns0_to_ns0_ts_parse_error'}
+                        continue
+                    if origin_dt < cutoff_date:
+                        # Evento originale fuori dal cutoff: voce troppo vecchia
+                        moves_cache[target_title] = {
+                            'processed_at': now_str, 'result': 'rejected',
+                            'reason': 'ns0_to_ns0_old'}
+                        continue
+                    # Evento originale nel cutoff: includi la voce
                     moves_cache[target_title] = {
-                        'processed_at': now_str, 'result': 'rejected', 'reason': 'ns0_to_ns0'}
+                        'processed_at': now_str, 'result': 'accepted',
+                        'reason': f'ns0_to_ns0_{origin_type}'}
+                    found_titles[target_title] = move_ts_str
+                    origin_timestamps[target_title] = origin_ts
+                    source_title = source_page.title()
+                    print(f"    Rinominazione NS0->NS0: '{source_title}' -> '{target_title}' "
+                          f"(origine: {origin_ts[:8]}, tipo: {origin_type})")
                     continue
+
+                # Spostamento NS!=0 -> NS0 (logica originale)
                 target_page = pywikibot.Page(site, target_title)
                 if int(target_page.namespace()) != 0:
                     moves_cache[target_title] = {
@@ -2389,8 +2540,9 @@ def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
         print(f"    Errore log spostamenti: {e}")
 
     print(f"    Log spostamenti: {checked} controllati, "
-          f"{len(found_titles)} trovati, {skipped_cached} skip da cache")
-    return found_titles
+          f"{len(found_titles)} trovati ({len(origin_timestamps)} NS0->NS0 accettati), "
+          f"{skipped_cached} skip da cache")
+    return found_titles, origin_timestamps
 
 
 # ========================================
