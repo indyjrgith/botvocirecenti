@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.6
+Bot VociRecenti v9.6.1
 
 Changelog:
-- v9.6: FIX aggiunta 'ns0_to_ns0' alle stale_reasons in get_moved_to_ns0_since_cutoff.
+- v9.6.1: FIX aggiunta 'ns0_to_ns0' alle stale_reasons in get_moved_to_ns0_since_cutoff.
         La reason 'ns0_to_ns0' (senza suffisso) era scritta da versioni pre-v9.3 e non
         era inclusa nella whitelist di v9.5, causando lo skip delle voci con quella entry.
 - v9.5: FIX riprocessamento entry moves_cache con reason legate al bug v9.3.
@@ -1426,7 +1426,13 @@ def _cleanup_remove_old_pages(pages, cutoff_date):
     for page in pages:
         title = page['titolo']
         move_ts_str = page.get('move_timestamp', '')
-        ref_str = move_ts_str if move_ts_str else page.get('timestamp', '')
+        # Per voci NS0->NS0 (ns0_origin=True), il timestamp e' gia' l'origin_ts
+        # (impostato da download_page_data_batch). Il move_timestamp e' lo
+        # spostamento recente e non e' il riferimento corretto per il cutoff.
+        if page.get('ns0_origin') and move_ts_str:
+            ref_str = page.get('timestamp', '')
+        else:
+            ref_str = move_ts_str if move_ts_str else page.get('timestamp', '')
         try:
             ref_date = datetime.strptime(ref_str, '%Y%m%d%H%M%S')
         except Exception:
@@ -1897,6 +1903,8 @@ def download_page_data_batch(titles, existing_titles, cutoff_date, moves_cache=N
         }
         if move_ts_str:
             record['move_timestamp'] = move_ts_str
+        if origin_timestamps and title in origin_timestamps:
+            record['ns0_origin'] = True
 
         pages_data.append(record)
         existing_titles.add(title)
@@ -2516,9 +2524,9 @@ def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
                     # la logica corretta di v9.4+.
                     _stale_reasons = {
                         'ns0_to_ns0',           # residuo pre-v9.3 (reason generica)
-                        'ns0_to_ns0_old',
                         'ns0_to_ns0_api_error',
-                        'ns0_to_ns0_ts_parse_error',
+                        # ns0_to_ns0_old e ns0_to_ns0_ts_parse_error sono risultati
+                        # definitivi corretti: non vanno riprocessati.
                     }
                     if cached.get('reason') not in _stale_reasons:
                         skipped_cached += 1
