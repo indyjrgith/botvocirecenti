@@ -1,8 +1,20 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.4
+Bot VociRecenti v9.5
 
 Changelog:
+- v9.5: FIX riprocessamento entry moves_cache con reason legate al bug v9.3.
+        In v9.3, _get_ns0_origin_timestamp riceveva il titolo DESTINAZIONE
+        invece del titolo SORGENTE (bug corretto in v9.4). Le entry scritte
+        in cache durante i run di v9.3 con result='rejected' e reason in
+        {ns0_to_ns0_old, ns0_to_ns0_api_error, ns0_to_ns0_ts_parse_error}
+        potevano pero' essere errate (il calcolo dell'origine era sbagliato).
+        Con la cache valida per 30 giorni, queste entry bloccavano il
+        riprocessamento della voce anche con la logica corretta di v9.4+.
+        Fix: il check di skip in get_moved_to_ns0_since_cutoff non salta piu'
+        le entry rejected con quelle tre reason; vengono riprocessate con la
+        logica corretta. Tutte le altre reason rejected (ns0, ns{X}, ecc.)
+        restano valide e continuano a essere skippate normalmente.
 - v9.4: FIX risalita catena spostamenti NS0->NS0 in _get_ns0_origin_timestamp.
         In precedenza la funzione riceveva il titolo DESTINAZIONE dello spostamento
         e chiamava logevents(page=target_title). Poiche' letitle filtra sul titolo
@@ -200,7 +212,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.4'
+VERSION = '9.5'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -2496,8 +2508,17 @@ def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
                     continue
                 cached = moves_cache.get(target_title)
                 if cached and cached.get('result') == 'rejected':
-                    skipped_cached += 1
-                    continue
+                    # Non skippare le reason legate al bug v9.3 (titolo sbagliato
+                    # passato a _get_ns0_origin_timestamp): vanno riprocessate con
+                    # la logica corretta di v9.4+.
+                    _stale_reasons = {
+                        'ns0_to_ns0_old',
+                        'ns0_to_ns0_api_error',
+                        'ns0_to_ns0_ts_parse_error',
+                    }
+                    if cached.get('reason') not in _stale_reasons:
+                        skipped_cached += 1
+                        continue
                 source_page = log.page()
                 source_ns = int(source_page.namespace())
 
