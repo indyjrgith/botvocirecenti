@@ -1,8 +1,20 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.3
+Bot VociRecenti v9.4
 
 Changelog:
+- v9.4: FIX risalita catena spostamenti NS0->NS0 in _get_ns0_origin_timestamp.
+        In precedenza la funzione riceveva il titolo DESTINAZIONE dello spostamento
+        e chiamava logevents(page=target_title). Poiche' letitle filtra sul titolo
+        SORGENTE del log, la query non trovava gli spostamenti precedenti della voce
+        (che erano registrati con il titolo sorgente intermedio, diverso da target_title).
+        Es. catena: Sandbox50 -[28apr]-> "Parco Nazionale" -[22mag]-> "Parco nazionale"
+        Con letitle="Parco nazionale" non si trovava il log del 28 apr (sorgente=Sandbox50).
+        Fix: in get_moved_to_ns0_since_cutoff si passa ora source_title (titolo sorgente
+        dello spostamento NS0->NS0) invece di target_title. Cosi' logevents(page=source_title)
+        trova gli spostamenti precedenti della stessa voce registrati con quel titolo.
+        Il fallback alla prima revisione rimane come ultima rete di sicurezza.
+        Firma di _get_ns0_origin_timestamp invariata; cambia solo il call site.
 - v9.3: FIX rilevamento rinominazioni NS0->NS0.
         In precedenza, spostamenti dove sia sorgente che destinazione erano in NS0
         venivano scartati immediatamente per evitare di includere voci vecchie
@@ -188,7 +200,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.3'
+VERSION = '9.4'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -2490,8 +2502,14 @@ def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
                 source_ns = int(source_page.namespace())
 
                 if source_ns == 0:
-                    # Spostamento NS0->NS0: risali la catena per trovare l'evento originale
-                    origin_ts, origin_type = _get_ns0_origin_timestamp(target_title, cutoff_date)
+                    # Spostamento NS0->NS0: risali la catena per trovare l'evento originale.
+                    # Si passa source_title (titolo SORGENTE dello spostamento) perche'
+                    # letitle filtra sul titolo sorgente del log: logevents(page=source_title)
+                    # trova gli spostamenti precedenti della voce registrati con quel titolo.
+                    # Es. catena Sandbox->A->[22mag]->B: chiamando con "A" si trova il log
+                    # Sandbox->A (28apr, NS!=0->NS0) che e' l'evento originale cercato.
+                    source_title = source_page.title()
+                    origin_ts, origin_type = _get_ns0_origin_timestamp(source_title, cutoff_date)
                     if origin_ts is None:
                         # Errore API: scarta cautelativamente
                         moves_cache[target_title] = {
@@ -2517,7 +2535,6 @@ def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
                         'reason': f'ns0_to_ns0_{origin_type}'}
                     found_titles[target_title] = move_ts_str
                     origin_timestamps[target_title] = origin_ts
-                    source_title = source_page.title()
                     print(f"    Rinominazione NS0->NS0: '{source_title}' -> '{target_title}' "
                           f"(origine: {origin_ts[:8]}, tipo: {origin_type})")
                     continue
