@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.6.1
+Bot VociRecenti v9.6.2
 
 Changelog:
-- v9.6.1: FIX aggiunta 'ns0_to_ns0' alle stale_reasons in get_moved_to_ns0_since_cutoff.
+- v9.6: FIX aggiunta 'ns0_to_ns0' alle stale_reasons in get_moved_to_ns0_since_cutoff.
         La reason 'ns0_to_ns0' (senza suffisso) era scritta da versioni pre-v9.3 e non
         era inclusa nella whitelist di v9.5, causando lo skip delle voci con quella entry.
 - v9.5: FIX riprocessamento entry moves_cache con reason legate al bug v9.3.
@@ -215,7 +215,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.6'
+VERSION = '9.6.2'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -2399,7 +2399,7 @@ def get_new_creations_since_cutoff(existing_titles, cutoff_str):
     return found_titles, recreation_timestamps
 
 
-def _get_ns0_origin_timestamp(title, cutoff_date):
+def _get_ns0_origin_timestamp(title, cutoff_date, target_title=None):
     """
     Per una voce che ha avuto uno spostamento NS0->NS0 recente, risale la catena
     degli spostamenti (fino a MAX_NS0_CHAIN_DEPTH log) cercando il primo evento
@@ -2409,6 +2409,13 @@ def _get_ns0_origin_timestamp(title, cutoff_date):
          -> restituisce (move_timestamp_IT, 'move')
       2. Se non trovato: la data di creazione della pagina (prima revisione)
          -> restituisce (creation_ts_IT, 'creation')
+
+    title: titolo SORGENTE dello spostamento NS0->NS0 (usato per i logevents).
+    target_title: titolo DESTINAZIONE dello spostamento NS0->NS0. Dopo lo spostamento,
+        il titolo sorgente e' diventato un redirect: la sua prima revisione e' quella
+        del redirect automatico (data recente), non quella della pagina originale.
+        Per il ramo 'creation' si usa quindi target_title, che contiene la storia
+        completa della pagina inclusa la revisione di creazione originale.
 
     Restituisce (timestamp_str_IT, tipo) oppure (None, None) in caso di errore.
     La chiamata e' limitata a MAX_NS0_CHAIN_DEPTH=10 log per limitare il costo API.
@@ -2447,11 +2454,16 @@ def _get_ns0_origin_timestamp(title, cutoff_date):
 
         # Nessuno spostamento da NS!=0 trovato: la voce e' sempre stata in NS0.
         # Usiamo la data di prima revisione (creazione diretta in NS0).
+        # IMPORTANTE: dopo uno spostamento NS0->NS0, il titolo sorgente (title) e'
+        # diventato un redirect automatico: la sua prima revisione e' quella del
+        # redirect (data recente), non quella originale. Si usa target_title, che
+        # mantiene la storia completa della pagina, per trovare la vera data di creazione.
+        creation_query_title = target_title if target_title else title
         try:
             params_rev = {
                 'action': 'query',
                 'prop': 'revisions',
-                'titles': title,
+                'titles': creation_query_title,
                 'rvprop': 'timestamp',
                 'rvdir': 'newer',
                 'rvlimit': '1',
@@ -2542,7 +2554,7 @@ def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
                     # Es. catena Sandbox->A->[22mag]->B: chiamando con "A" si trova il log
                     # Sandbox->A (28apr, NS!=0->NS0) che e' l'evento originale cercato.
                     source_title = source_page.title()
-                    origin_ts, origin_type = _get_ns0_origin_timestamp(source_title, cutoff_date)
+                    origin_ts, origin_type = _get_ns0_origin_timestamp(source_title, cutoff_date, target_title=target_title)
                     if origin_ts is None:
                         # Errore API: scarta cautelativamente
                         moves_cache[target_title] = {
