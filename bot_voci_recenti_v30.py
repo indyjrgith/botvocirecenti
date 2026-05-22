@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.5
+Bot VociRecenti v9.6
 
 Changelog:
+- v9.6: FIX aggiunta 'ns0_to_ns0' alle stale_reasons in get_moved_to_ns0_since_cutoff.
+        La reason 'ns0_to_ns0' (senza suffisso) era scritta da versioni pre-v9.3 e non
+        era inclusa nella whitelist di v9.5, causando lo skip delle voci con quella entry.
 - v9.5: FIX riprocessamento entry moves_cache con reason legate al bug v9.3.
         In v9.3, _get_ns0_origin_timestamp riceveva il titolo DESTINAZIONE
         invece del titolo SORGENTE (bug corretto in v9.4). Le entry scritte
@@ -212,7 +215,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.5'
+VERSION = '9.6'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -2512,6 +2515,7 @@ def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
                     # passato a _get_ns0_origin_timestamp): vanno riprocessate con
                     # la logica corretta di v9.4+.
                     _stale_reasons = {
+                        'ns0_to_ns0',           # residuo pre-v9.3 (reason generica)
                         'ns0_to_ns0_old',
                         'ns0_to_ns0_api_error',
                         'ns0_to_ns0_ts_parse_error',
