@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.6.2
+Bot VociRecenti v9.6.3
 
 Changelog:
+- v9.6.3: DEBUG diagnostico per spostamenti NS0->NS0 non rilevati.
+        Aggiunge print di debug in get_moved_to_ns0_since_cutoff per tracciare
+        ogni spostamento NS0->NS0 trovato nel log e il motivo per cui viene
+        eventualmente saltato (existing_titles o moves_cache). Utile per
+        diagnosticare il caso 'Parco nazionale di Kahurangi' e simili.
+        Le print sono prefissate con [DEBUG] per facilitarne la ricerca nel log.
 - v9.6: FIX aggiunta 'ns0_to_ns0' alle stale_reasons in get_moved_to_ns0_since_cutoff.
         La reason 'ns0_to_ns0' (senza suffisso) era scritta da versioni pre-v9.3 e non
         era inclusa nella whitelist di v9.5, causando lo skip delle voci con quella entry.
@@ -215,7 +221,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.6.2'
+VERSION = '9.6.3'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -2528,6 +2534,7 @@ def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
                 if not target_title:
                     continue
                 if target_title in existing_titles:
+                    print(f"    [DEBUG SKIP existing_titles] target='{target_title}'")
                     continue
                 cached = moves_cache.get(target_title)
                 if cached and cached.get('result') == 'rejected':
@@ -2541,6 +2548,7 @@ def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
                         # definitivi corretti: non vanno riprocessati.
                     }
                     if cached.get('reason') not in _stale_reasons:
+                        print(f"    [DEBUG SKIP moves_cache] target='{target_title}' reason='{cached.get('reason')}'")
                         skipped_cached += 1
                         continue
                 source_page = log.page()
@@ -2554,6 +2562,7 @@ def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
                     # Es. catena Sandbox->A->[22mag]->B: chiamando con "A" si trova il log
                     # Sandbox->A (28apr, NS!=0->NS0) che e' l'evento originale cercato.
                     source_title = source_page.title()
+                    print(f"    [DEBUG NS0->NS0] source='{source_title}' target='{target_title}'")
                     origin_ts, origin_type = _get_ns0_origin_timestamp(source_title, cutoff_date, target_title=target_title)
                     if origin_ts is None:
                         # Errore API: scarta cautelativamente
