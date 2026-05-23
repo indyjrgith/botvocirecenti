@@ -1,8 +1,21 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.6.4
+Bot VociRecenti v9.6.5
 
 Changelog:
+- v9.6.5: FIX rilevamento ingresso NS!=0->NS0 in _get_ns0_origin_timestamp.
+        Bug: log.page().namespace() restituisce il namespace ATTUALE del titolo
+        sorgente. Dopo uno spostamento NS!=0->NS0, il titolo sorgente diventa un
+        redirect in NS0, quindi namespace() restituisce 0 anziche' il namespace
+        originale (es. 118 per Bozza). Questo impediva di trovare l'ingresso
+        originale in NS0 nella catena degli spostamenti, causando il fallback
+        alla prima revisione (data di creazione in NS!=0, fuori cutoff).
+        Fix: usare log.data['ns'] (namespace sorgente al momento dell'evento)
+        e params['target_ns'] (namespace destinazione), con fallback al metodo
+        precedente se i campi non sono presenti. Caso diagnosticato:
+        'Parco nazionale di Kahurangi' (spostata da Bozza il 28 apr, poi
+        rinominata in NS0; la bozza era diventata redirect in NS0 e namespace()
+        restituiva 0 invece di 118).
 - v9.6.4: FIX aggiunta 'ns0_to_ns0_old' alle stale_reasons.
         Causa del bug "Parco nazionale di Kahurangi": in un run precedente
         _get_ns0_origin_timestamp aveva restituito un origin_ts sbagliato
@@ -229,7 +242,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.6.4'
+VERSION = '9.6.5'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -2450,12 +2463,23 @@ def _get_ns0_origin_timestamp(title, cutoff_date, target_title=None):
         for log in logs:
             try:
                 params = log.data.get('params', log.data)
-                # Il titolo sorgente e' la pagina del log stesso
-                src_page = log.page()
-                src_ns = int(src_page.namespace())
+                # BUG FIX v9.6.5: usare log.data['ns'] invece di log.page().namespace().
+                # log.page().namespace() restituisce il namespace ATTUALE della pagina
+                # sorgente, ma dopo uno spostamento NS!=0->NS0 il titolo sorgente diventa
+                # un redirect in NS0: quindi namespace() restituisce 0 anche se al momento
+                # dello spostamento era NS118 o NS2. Questo causava il mancato rilevamento
+                # dell'ingresso originale in NS0 (es. Parco nazionale di Kahurangi).
+                # log.data['ns'] e' il namespace della pagina SORGENTE al momento dell'evento,
+                # esattamente quello che serve per risalire la catena correttamente.
+                src_ns = int(log.data.get('ns', -1))
                 tgt_title = params.get('target_title', '')
-                tgt_page = pywikibot.Page(site, tgt_title) if tgt_title else None
-                tgt_ns = int(tgt_page.namespace()) if tgt_page else -1
+                tgt_ns = int(params.get('target_ns', -1))
+                if src_ns == -1 or tgt_ns == -1:
+                    # Fallback se i campi non sono presenti (API piu' vecchie)
+                    src_page = log.page()
+                    src_ns = int(src_page.namespace())
+                    tgt_page = pywikibot.Page(site, tgt_title) if tgt_title else None
+                    tgt_ns = int(tgt_page.namespace()) if tgt_page else -1
                 if src_ns != 0 and tgt_ns == 0:
                     # Trovato ingresso da NS!=0 -> questo e' l'evento originale
                     origin_ts = ts_utc_to_it(log.timestamp())
