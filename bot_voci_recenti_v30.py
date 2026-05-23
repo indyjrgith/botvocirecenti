@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.6.3
+Bot VociRecenti v9.6.4
 
 Changelog:
+- v9.6.4: FIX aggiunta 'ns0_to_ns0_old' alle stale_reasons.
+        Causa del bug "Parco nazionale di Kahurangi": in un run precedente
+        _get_ns0_origin_timestamp aveva restituito un origin_ts sbagliato
+        (troppo vecchio), causando la scrittura di ns0_to_ns0_old in moves_cache.
+        Nei run successivi quella entry bloccava il riprocessamento, perche'
+        ns0_to_ns0_old non era in _stale_reasons. Ora viene riprocessata.
+        Aggiunta anche print di debug quando origin_dt < cutoff_date, per
+        tracciare il timestamp che ha causato lo scarto.
 - v9.6.3: DEBUG diagnostico per spostamenti NS0->NS0 non rilevati.
         Aggiunge print di debug in get_moved_to_ns0_since_cutoff per tracciare
         ogni spostamento NS0->NS0 trovato nel log e il motivo per cui viene
@@ -221,7 +229,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.6.3'
+VERSION = '9.6.4'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -2538,14 +2546,19 @@ def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
                     continue
                 cached = moves_cache.get(target_title)
                 if cached and cached.get('result') == 'rejected':
-                    # Non skippare le reason legate al bug v9.3 (titolo sbagliato
-                    # passato a _get_ns0_origin_timestamp): vanno riprocessate con
-                    # la logica corretta di v9.4+.
+                    # Non skippare le reason legate a calcoli errati precedenti:
+                    # vanno riprocessate con la logica corretta di v9.4+.
+                    # - 'ns0_to_ns0': residuo pre-v9.3 (reason generica)
+                    # - 'ns0_to_ns0_api_error': errore API transitorio
+                    # - 'ns0_to_ns0_old': potrebbe essere stato calcolato con
+                    #   origin_ts sbagliato (bug documentato: Parco nazionale di
+                    #   Kahurangi). Va riprocessato.
+                    # Solo 'ns0_to_ns0_ts_parse_error' e reason non-NS0->NS0
+                    # sono definitivi e non vanno riprocessati.
                     _stale_reasons = {
-                        'ns0_to_ns0',           # residuo pre-v9.3 (reason generica)
+                        'ns0_to_ns0',
                         'ns0_to_ns0_api_error',
-                        # ns0_to_ns0_old e ns0_to_ns0_ts_parse_error sono risultati
-                        # definitivi corretti: non vanno riprocessati.
+                        'ns0_to_ns0_old',
                     }
                     if cached.get('reason') not in _stale_reasons:
                         print(f"    [DEBUG SKIP moves_cache] target='{target_title}' reason='{cached.get('reason')}'")
@@ -2579,6 +2592,9 @@ def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
                         continue
                     if origin_dt < cutoff_date:
                         # Evento originale fuori dal cutoff: voce troppo vecchia
+                        print(f"    [DEBUG NS0->NS0 OLD] target='{target_title}' "
+                              f"origin_ts={origin_ts} origin_type={origin_type} "
+                              f"cutoff={cutoff_date.strftime('%Y%m%d%H%M%S')}")
                         moves_cache[target_title] = {
                             'processed_at': now_str, 'result': 'rejected',
                             'reason': 'ns0_to_ns0_old'}
