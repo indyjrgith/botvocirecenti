@@ -1,8 +1,29 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.6.5
+Bot VociRecenti v9.6.6
 
 Changelog:
+- v9.6.6: FIX timestamp errato per voci rinominate NS0->NS0 intercettate da RC.
+        Bug: get_new_creations_since_cutoff veniva eseguita PRIMA di
+        get_moved_to_ns0_since_cutoff. Quando una voce subisce una rinominazione
+        NS0->NS0, MediaWiki registra in RecentChanges la creazione della pagina
+        destinazione come evento 'new'. La Fonte 1 (RC) la raccoglieva con il
+        timestamp della rinominazione recente, aggiungendola a existing_titles.
+        Quando poi la Fonte 2 (log spostamenti) trovava lo stesso titolo come
+        target dello spostamento NS0->NS0, lo skippava con [DEBUG SKIP
+        existing_titles], impedendo la risalita alla catena degli spostamenti
+        e la correzione del timestamp all'evento originale (es. ingresso da Bozza).
+        Risultato: la voce appariva in lista con il timestamp della rinominazione
+        recente invece di quello dello spostamento originale da NS!=0.
+        Caso diagnosticato: 'Parco nazionale Abel Tasman' (spostata da sandbox
+        ad aprile, rinominata N->n a maggio: appariva con timestamp di maggio).
+        Fix: in get_new_pages_only si esegue prima la Fonte 2 (log spostamenti),
+        poi la Fonte 1 (RC) con i titoli gia' trovati aggiunti allo schermo
+        existing_titles tramite il parametro extra_skip di
+        get_new_creations_since_cutoff. Cosi' i titoli gia' gestiti correttamente
+        dalla Fonte 2 non vengono intercettati dalla Fonte 1 con timestamp sbagliato.
+        Nessuna chiamata API aggiuntiva; nessuna modifica alla logica di
+        get_moved_to_ns0_since_cutoff o _get_ns0_origin_timestamp.
 - v9.6.5: FIX rilevamento ingresso NS!=0->NS0 in _get_ns0_origin_timestamp.
         Bug: log.page().namespace() restituisce il namespace ATTUALE del titolo
         sorgente. Dopo uno spostamento NS!=0->NS0, il titolo sorgente diventa un
@@ -242,7 +263,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.6.5'
+VERSION = '9.6.6'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -2332,16 +2353,23 @@ def get_new_pages_only(existing_titles, cutoff_date, moves_cache):
     candidate_titles = set()
     cutoff_str = cutoff_date.strftime('%Y%m%d%H%M%S')
 
-    print("\nFonte 1: Creazioni dirette NS0...")
-    direct, recreation_timestamps = get_new_creations_since_cutoff(existing_titles, cutoff_str)
-    candidate_titles.update(direct)
-    print(f"  Trovate: {len(direct)} voci candidate ({len(recreation_timestamps)} ricreazioni)")
-
+    # Fonte 2 eseguita PRIMA di Fonte 1: i titoli gia' gestiti dal log degli
+    # spostamenti (incluse rinominazioni NS0->NS0) vengono passati come extra_skip
+    # a get_new_creations_since_cutoff, evitando che RC li intercetti come creazioni
+    # nuove con timestamp sbagliato (quello della rinominazione recente invece
+    # dell'evento originale). Vedi fix v9.6.6.
     print("\nFonte 2: Spostamenti in NS0 dal log...")
     moved, origin_timestamps = get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache)
     candidate_titles.update(moved.keys())
-    move_timestamps = {**recreation_timestamps, **moved}
     print(f"  Trovate: {len(moved)} voci spostate ({len(origin_timestamps)} NS0->NS0 accettate)")
+
+    print("\nFonte 1: Creazioni dirette NS0...")
+    direct, recreation_timestamps = get_new_creations_since_cutoff(
+        existing_titles, cutoff_str, extra_skip=set(moved.keys()))
+    candidate_titles.update(direct)
+    print(f"  Trovate: {len(direct)} voci candidate ({len(recreation_timestamps)} ricreazioni)")
+
+    move_timestamps = {**recreation_timestamps, **moved}
 
     print(f"\nTotale candidate NS0: {len(candidate_titles)}")
     print(f"Scaricamento dati completi (batch API)...")
@@ -2353,10 +2381,15 @@ def get_new_pages_only(existing_titles, cutoff_date, moves_cache):
     return new_pages
 
 
-def get_new_creations_since_cutoff(existing_titles, cutoff_str):
+def get_new_creations_since_cutoff(existing_titles, cutoff_str, extra_skip=None):
     """
     Scorre RecentChanges NS0 (solo nuove creazioni) fino a cutoff_str.
     Restituisce (found_titles, recreation_timestamps).
+
+    extra_skip: set opzionale di titoli aggiuntivi da ignorare (oltre a
+        existing_titles). Usato per escludere i titoli gia' gestiti dalla
+        Fonte 2 (log spostamenti), che in RC appaiono come creazioni nuove
+        quando sono destinazione di spostamenti NS0->NS0.
     """
     site = SITE
     found_titles = set()
@@ -2405,7 +2438,7 @@ def get_new_creations_since_cutoff(existing_titles, cutoff_str):
                 if rc_ts_it and rc_ts_it < cutoff_str:
                     stop = True
                     break
-                if title not in existing_titles:
+                if title not in existing_titles and (extra_skip is None or title not in extra_skip):
                     found_titles.add(title)
                     tags = change.get('tags', [])
                     if 'mw-recreated' in tags and rc_ts_it:
