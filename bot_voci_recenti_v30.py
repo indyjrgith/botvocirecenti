@@ -1,30 +1,32 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.7.0
+Bot VociRecenti v9.7.1
 
 Changelog:
-- v9.7.0: OTTIMIZZAZIONE PRESTAZIONI: riduzione chiamate API revisions in FASE 3 pulizia.
-        Problema: _cleanup_check_and_update_pages_batch chiamava prop=revisions per TUTTE
-        le voci in cache ad ogni run (CHIAMATA A: una per titolo per rvdir=newer;
-        CHIAMATA B: batch da CLEANUP_BATCH_SIZE_REV). Con 2848 voci e batch=10 questo
-        generava ~285 batch + 2848 chiamate singole, dominando il tempo di STEP 2 (5m35s).
+- v9.7.0: OTTIMIZZAZIONE PRESTAZIONI: riduzione chiamate API revisions in FASE 3 pulizia
+        e in STEP 4b (nuove voci NS0).
+        Problema: sia _cleanup_check_and_update_pages_batch che download_page_data_batch
+        chiamavano prop=revisions per TUTTE le voci ad ogni run (CHIAMATA A: una per
+        titolo per rvdir=newer; CHIAMATA B: batch da CLEANUP_BATCH_SIZE_REV).
+        Con 2848 voci in pulizia e 1281 nuove voci il totale era ~5m35s + ~10m per revisions.
         Fix 1 (Filone A): CLEANUP_BATCH_SIZE_REV alzato da 10 a 20.
-        Fix 2 (Filone B): introdotta touched_cache in moves_cache (chiavi '__touched__:<titolo>').
-        La passata prop=info gia' eseguita restituisce il campo 'touched' (ultimo timestamp
-        di modifica della pagina) senza chiamate aggiuntive. Confrontandolo con il valore
-        salvato in touched_cache si determina se la voce e' stata modificata dall'ultimo run:
-          - touched invariato -> skip revisions (wikitext e creation_ts non cambiano)
-          - touched cambiato o assente -> revisions come prima
-        Al primo run dopo il deploy tutte le voci hanno touched_cache vuota -> comportamento
-        identico alla versione precedente. Dai run successivi solo le voci effettivamente
-        modificate richiedono revisions: atteso calo da ~285 batch a una manciata.
-        Le entry __touched__ in moves_cache non hanno 'processed_at' e vengono escluse
-        dalla pulizia per scadenza in load_moves_cache (che filtra solo le entry con
-        'processed_at'). moves_cache viene caricata prima di STEP 2 (anziche' in STEP 4b)
-        per renderla disponibile a run_cleanup_internal; il salvataggio avviene invariato
-        dopo STEP 4b e STEP 5.
-        Firma di run_cleanup_internal aggiornata: accetta moves_cache opzionale.
-        Firma di _cleanup_check_and_update_pages_batch aggiornata: accetta moves_cache.
+        Fix 2 (Filone B - pulizia): introdotta touched_cache in moves_cache con chiavi
+        '__touched__:<titolo>'. La passata prop=info gia' eseguita restituisce 'touched'
+        gratis. Voci con touched invariato saltano revisions; solo categorie aggiornate
+        se cambiate. Prima esecuzione: comportamento identico alla versione precedente.
+        Fix 3 (Filone B - nuove voci): stessa logica in download_page_data_batch.
+        touched + templates + preview + timestamp salvati direttamente nell'entry
+        moves_cache esistente (result=accepted). Al run successivo, voci con touched
+        invariato saltano revisions e il record viene ricostruito da moves_cache +
+        categorie fresche dalla PASSATA 2. Voci con move_timestamp nuovo (rinominazioni)
+        seguono sempre il percorso completo per aggiornare il record correttamente.
+        Le entry __touched__:* in moves_cache (pulizia) non hanno 'processed_at' e
+        vengono escluse dalla pulizia per scadenza in load_moves_cache.
+        moves_cache viene caricata prima di STEP 2 (anziche' in STEP 4b) per renderla
+        disponibile a run_cleanup_internal; il salvataggio avviene invariato dopo STEP 4b
+        e STEP 5.
+        Firme aggiornate: run_cleanup_internal e _cleanup_check_and_update_pages_batch
+        accettano moves_cache opzionale.
 - v9.6.7: FIX regressione prestazioni introdotta con il fix NS0->NS0 (v9.3+).
         Il tempo di esecuzione era piu' che raddoppiato (17 min vs 7 min) per via
         di chiamate API aggiuntive eseguite su ogni voce nel log degli spostamenti:
@@ -302,7 +304,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.7.0'
+VERSION = '9.7.1'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -1901,11 +1903,16 @@ def download_page_data_batch(titles, existing_titles, cutoff_date, moves_cache=N
 
     Tre passate batch:
       1. prop=info (BATCH_SIZE_CHECK titoli): rilevamento non esistenti/redirect/NS errato
+         + raccolta 'touched' per touched_cache (v9.7.0)
       2. prop=categories (CLEANUP_BATCH_SIZE titoli): categorie
       3. prop=revisions (CLEANUP_BATCH_SIZE_REV titoli): wikitext + timestamp creazione
+         Solo per voci con touched cambiato o non ancora in moves_cache come accepted
+         con templates/preview/timestamp salvati (touched_cache, v9.7.0).
 
     Salta: duplicati, non esistenti, redirect, voci create prima di cutoff_date.
     Se moves_cache e' fornito, registra i rifiuti per evitare riverifiche nei run futuri.
+    Per le voci accepted, salva touched+templates+preview+timestamp in moves_cache
+    per permettere lo skip di revisions ai run successivi se touched invariato.
     move_timestamps: dict {titolo: move_ts_str} con timestamp di spostamento recente in NS0.
     origin_timestamps: dict {titolo: ts_str} con timestamp dell'evento originale per voci
                        NS0->NS0; se presente, sovrascrive creation_ts come 'timestamp' del
@@ -1954,6 +1961,7 @@ def download_page_data_batch(titles, existing_titles, cutoff_date, moves_cache=N
     skipped_notexist = []
     skipped_redirect = []
     skipped_wrong_ns = []
+    touched_by_title = {}  # {title: touched_str} da prop=info
 
     for title in filtered:
         page_info = info_by_title.get(title)
@@ -1977,6 +1985,9 @@ def download_page_data_batch(titles, existing_titles, cutoff_date, moves_cache=N
                 moves_cache[title] = {'processed_at': now_str, 'result': 'rejected', 'reason': f"ns{page_info.get('ns','')}"}
             continue
         survivors.append(title)
+        touched = page_info.get('touched', '')
+        if touched:
+            touched_by_title[title] = touched
 
     print(f"  Sopravvissuti: {len(survivors)} / {len(filtered)} "
           f"(non esistono: {len(skipped_notexist)}, redirect: {len(skipped_redirect)}, NS errato: {len(skipped_wrong_ns)})")
@@ -1984,13 +1995,44 @@ def download_page_data_batch(titles, existing_titles, cutoff_date, moves_cache=N
     if not survivors:
         return []
 
+    # Touched_cache: determina quali voci richiedono revisions.
+    # Una voce puo' saltare revisions solo se:
+    #   - e' gia' in moves_cache come 'accepted' con touched, templates, preview, timestamp
+    #   - il touched attuale coincide con quello salvato
+    #   - NON ha un nuovo move_timestamp (rinominazione recente potrebbe cambiare il record)
+    titles_need_rev = []
+    titles_skip_rev = []
+    if moves_cache is not None:
+        for title in survivors:
+            cached = moves_cache.get(title, {})
+            touched_now = touched_by_title.get(title, '')
+            has_new_move = move_timestamps and title in move_timestamps
+            can_skip = (
+                cached.get('result') == 'accepted'
+                and touched_now
+                and touched_now == cached.get('touched', '')
+                and 'timestamp' in cached
+                and 'templates' in cached
+                and 'preview' in cached
+                and not has_new_move
+            )
+            if can_skip:
+                titles_skip_rev.append(title)
+            else:
+                titles_need_rev.append(title)
+        print(f"  Touched cache: {len(titles_skip_rev)} voci invariate (skip revisions), "
+              f"{len(titles_need_rev)} voci modificate o nuove (revisions necessarie)")
+    else:
+        titles_need_rev = survivors
+        titles_skip_rev = []
+
     # --- PASSATA 2: prop=categories ---
     print(f"  [2/3] prop=categories per {len(survivors)} titoli...")
     cats_by_title = _batch_fetch_categories(survivors)
 
-    # --- PASSATA 3: prop=revisions ---
-    print(f"  [3/3] prop=revisions per {len(survivors)} titoli ({CLEANUP_BATCH_SIZE_REV} titoli/chiamata)...")
-    rev_by_title = _batch_fetch_wikitext(survivors)
+    # --- PASSATA 3: prop=revisions (solo per voci che ne hanno bisogno) ---
+    print(f"  [3/3] prop=revisions per {len(titles_need_rev)} titoli ({CLEANUP_BATCH_SIZE_REV} titoli/chiamata)...")
+    rev_by_title = _batch_fetch_wikitext(titles_need_rev) if titles_need_rev else {}
 
     # --- Costruzione record ---
     pages_data = []
@@ -1998,6 +2040,37 @@ def download_page_data_batch(titles, existing_titles, cutoff_date, moves_cache=N
     skipped_error = []
 
     for title in survivors:
+        move_ts_str = move_timestamps.get(title) if move_timestamps else None
+
+        if title in titles_skip_rev:
+            # Voce invariata: ricostruisci il record da moves_cache + categorie fresche
+            cached = moves_cache[title]
+            timestamp = cached['timestamp']
+            templates = cached['templates']
+            preview = cached['preview']
+            categories        = cats_by_title.get(title, {}).get('visible', [])
+            categories_hidden = cats_by_title.get(title, {}).get('hidden', [])
+            record = {
+                'titolo': title,
+                'timestamp': timestamp,
+                'categorie': categories,
+                'categorie_nascoste': categories_hidden,
+                'templates': templates,
+                'preview': preview
+            }
+            if move_ts_str:
+                record['move_timestamp'] = move_ts_str
+            if origin_timestamps and title in origin_timestamps:
+                record['ns0_origin'] = True
+            pages_data.append(record)
+            existing_titles.add(title)
+            # Aggiorna touched (potrebbe essere cambiato il move_ts ma non il wikitext)
+            touched_now = touched_by_title.get(title, '')
+            if touched_now:
+                moves_cache[title]['touched'] = touched_now
+            continue
+
+        # Percorso completo: revisions disponibili
         rev_data = rev_by_title.get(title, {})
         wikitext = rev_data.get('wikitext', '')
         creation_ts = rev_data.get('creation_ts', '')
@@ -2015,7 +2088,6 @@ def download_page_data_batch(titles, existing_titles, cutoff_date, moves_cache=N
             timestamp = origin_timestamps[title]
 
         # Controllo eta'
-        move_ts_str = move_timestamps.get(title) if move_timestamps else None
         if move_ts_str:
             try:
                 ref_date = datetime.strptime(move_ts_str, '%Y%m%d%H%M%S')
@@ -2060,6 +2132,20 @@ def download_page_data_batch(titles, existing_titles, cutoff_date, moves_cache=N
 
         pages_data.append(record)
         existing_titles.add(title)
+
+        # Salva touched + dati del record in moves_cache per skip revisions ai run futuri
+        if moves_cache is not None:
+            touched_now = touched_by_title.get(title, '')
+            entry = moves_cache.get(title, {})
+            entry['processed_at'] = now_str
+            entry['result'] = 'accepted'
+            entry['reason'] = entry.get('reason', 'ns0')
+            if touched_now:
+                entry['touched'] = touched_now
+            entry['timestamp'] = timestamp
+            entry['templates'] = templates
+            entry['preview'] = preview
+            moves_cache[title] = entry
 
     total_skipped = len(skipped_old) + len(skipped_error)
     if total_skipped > 0:
