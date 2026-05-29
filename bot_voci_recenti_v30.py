@@ -1,8 +1,25 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.6.6
+Bot VociRecenti v9.6.7
 
 Changelog:
+- v9.6.7: FIX regressione prestazioni introdotta con il fix NS0->NS0 (v9.3+).
+        Il tempo di esecuzione era piu' che raddoppiato (17 min vs 7 min) per via
+        di chiamate API aggiuntive eseguite su ogni voce nel log degli spostamenti:
+        1. log.page().namespace(): creava un oggetto Page e interrogava il namespace
+           corrente della pagina sorgente via API, invece di leggere log.data['ns']
+           che e' gia' nel payload del logevent (stessa tecnica del fix v9.6.5 in
+           _get_ns0_origin_timestamp).
+        2. pywikibot.Page(site, target_title).namespace(): costruiva un Page solo
+           per verificare il namespace della destinazione, invece di leggere
+           params['target_ns'] gia' presente nel log.
+        3. Print [DEBUG] su ogni voce scartata (NS0->NS0 OLD, SKIP moves_cache):
+           su centinaia di log generava I/O non trascurabile su stdout+file di log.
+        Fix: source_ns da log.data.get('ns'), target_ns da params.get('target_ns'),
+        con fallback a Page() solo se i campi non sono presenti (API piu' vecchie).
+        source_title dedotto da log.data.get('title') con fallback a log.page().title()
+        (necessario per la stampa e per _get_ns0_origin_timestamp).
+        Print [DEBUG] rimosse; rimane solo la stampa per voci effettivamente accettate.
 - v9.6.6: FIX timestamp errato per voci rinominate NS0->NS0 intercettate da RC.
         Bug: get_new_creations_since_cutoff veniva eseguita PRIMA di
         get_moved_to_ns0_since_cutoff. Quando una voce subisce una rinominazione
@@ -263,7 +280,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.6.6'
+VERSION = '9.6.7'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -2618,11 +2635,22 @@ def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
                         'ns0_to_ns0_old',
                     }
                     if cached.get('reason') not in _stale_reasons:
-                        print(f"    [DEBUG SKIP moves_cache] target='{target_title}' reason='{cached.get('reason')}'")
                         skipped_cached += 1
                         continue
-                source_page = log.page()
-                source_ns = int(source_page.namespace())
+                # FIX v9.6.7: source_ns e target_ns letti da log.data/params senza
+                # chiamate API aggiuntive (log.page().namespace() e
+                # pywikibot.Page(target_title).namespace() scatenavano una query
+                # per ogni voce nel log, raddoppiando il tempo di esecuzione).
+                # Stessa tecnica gia' usata in _get_ns0_origin_timestamp (fix v9.6.5).
+                source_ns = int(log.data.get('ns', -1))
+                target_ns = int(params.get('target_ns', -1))
+
+                if source_ns == -1:
+                    # Fallback: log.data['ns'] non disponibile (API piu' vecchie)
+                    source_ns = int(log.page().namespace())
+                if target_ns == -1:
+                    # Fallback: target_ns non disponibile, deduci dal titolo
+                    target_ns = int(pywikibot.Page(site, target_title).namespace())
 
                 if source_ns == 0:
                     # Spostamento NS0->NS0: risali la catena per trovare l'evento originale.
@@ -2631,8 +2659,7 @@ def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
                     # trova gli spostamenti precedenti della voce registrati con quel titolo.
                     # Es. catena Sandbox->A->[22mag]->B: chiamando con "A" si trova il log
                     # Sandbox->A (28apr, NS!=0->NS0) che e' l'evento originale cercato.
-                    source_title = source_page.title()
-                    print(f"    [DEBUG NS0->NS0] source='{source_title}' target='{target_title}'")
+                    source_title = log.data.get('title', '') or log.page().title()
                     origin_ts, origin_type = _get_ns0_origin_timestamp(source_title, cutoff_date, target_title=target_title)
                     if origin_ts is None:
                         # Errore API: scarta cautelativamente
@@ -2649,9 +2676,6 @@ def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
                         continue
                     if origin_dt < cutoff_date:
                         # Evento originale fuori dal cutoff: voce troppo vecchia
-                        print(f"    [DEBUG NS0->NS0 OLD] target='{target_title}' "
-                              f"origin_ts={origin_ts} origin_type={origin_type} "
-                              f"cutoff={cutoff_date.strftime('%Y%m%d%H%M%S')}")
                         moves_cache[target_title] = {
                             'processed_at': now_str, 'result': 'rejected',
                             'reason': 'ns0_to_ns0_old'}
@@ -2667,16 +2691,15 @@ def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
                     continue
 
                 # Spostamento NS!=0 -> NS0 (logica originale)
-                target_page = pywikibot.Page(site, target_title)
-                if int(target_page.namespace()) != 0:
+                if target_ns != 0:
                     moves_cache[target_title] = {
                         'processed_at': now_str, 'result': 'rejected',
-                        'reason': f"ns{target_page.namespace()}"}
+                        'reason': f"ns{target_ns}"}
                     continue
                 moves_cache[target_title] = {
                     'processed_at': now_str, 'result': 'accepted', 'reason': 'ns0'}
                 found_titles[target_title] = move_ts_str
-                source_title = source_page.title()
+                source_title = log.data.get('title', '') or log.page().title()
                 print(f"    Spostamento NS{source_ns}->NS0: '{source_title}' -> '{target_title}'")
             except Exception:
                 continue
