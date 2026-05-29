@@ -1,8 +1,30 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.6.7
+Bot VociRecenti v9.7.0
 
 Changelog:
+- v9.7.0: OTTIMIZZAZIONE PRESTAZIONI: riduzione chiamate API revisions in FASE 3 pulizia.
+        Problema: _cleanup_check_and_update_pages_batch chiamava prop=revisions per TUTTE
+        le voci in cache ad ogni run (CHIAMATA A: una per titolo per rvdir=newer;
+        CHIAMATA B: batch da CLEANUP_BATCH_SIZE_REV). Con 2848 voci e batch=10 questo
+        generava ~285 batch + 2848 chiamate singole, dominando il tempo di STEP 2 (5m35s).
+        Fix 1 (Filone A): CLEANUP_BATCH_SIZE_REV alzato da 10 a 20.
+        Fix 2 (Filone B): introdotta touched_cache in moves_cache (chiavi '__touched__:<titolo>').
+        La passata prop=info gia' eseguita restituisce il campo 'touched' (ultimo timestamp
+        di modifica della pagina) senza chiamate aggiuntive. Confrontandolo con il valore
+        salvato in touched_cache si determina se la voce e' stata modificata dall'ultimo run:
+          - touched invariato -> skip revisions (wikitext e creation_ts non cambiano)
+          - touched cambiato o assente -> revisions come prima
+        Al primo run dopo il deploy tutte le voci hanno touched_cache vuota -> comportamento
+        identico alla versione precedente. Dai run successivi solo le voci effettivamente
+        modificate richiedono revisions: atteso calo da ~285 batch a una manciata.
+        Le entry __touched__ in moves_cache non hanno 'processed_at' e vengono escluse
+        dalla pulizia per scadenza in load_moves_cache (che filtra solo le entry con
+        'processed_at'). moves_cache viene caricata prima di STEP 2 (anziche' in STEP 4b)
+        per renderla disponibile a run_cleanup_internal; il salvataggio avviene invariato
+        dopo STEP 4b e STEP 5.
+        Firma di run_cleanup_internal aggiornata: accetta moves_cache opzionale.
+        Firma di _cleanup_check_and_update_pages_batch aggiornata: accetta moves_cache.
 - v9.6.7: FIX regressione prestazioni introdotta con il fix NS0->NS0 (v9.3+).
         Il tempo di esecuzione era piu' che raddoppiato (17 min vs 7 min) per via
         di chiamate API aggiuntive eseguite su ogni voce nel log degli spostamenti:
@@ -280,7 +302,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.6.7'
+VERSION = '9.7.0'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -319,7 +341,7 @@ CLEANUP_REMOVE_REDIRECTS   = True
 CLEANUP_REMOVE_WRONG_NS    = True
 CLEANUP_REMOVE_TOO_OLD     = True
 CLEANUP_BATCH_SIZE         = 50   # titoli per chiamata API (max MediaWiki)
-CLEANUP_BATCH_SIZE_REV     = 10   # titoli per chiamata revisions (wikitext puo' essere grande)
+CLEANUP_BATCH_SIZE_REV     = 20   # titoli per chiamata revisions (wikitext puo' essere grande)
 CLEANUP_LOG_FILE           = os.path.join(DATA_DIR, 'pulizia_cache.log')
 
 # Controllo voci cancellate/redirect ad ogni run del bot (STEP 3b)
@@ -440,7 +462,10 @@ def load_moves_cache():
 
     cutoff = (now_it() - timedelta(days=MOVES_CACHE_MAX_AGE_DAYS)).strftime('%Y%m%d%H%M%S')
     before = len(cache)
-    cache = {t: v for t, v in cache.items() if v.get('processed_at', '0') >= cutoff}
+    # Le entry __touched__:* non hanno 'processed_at' e non vanno soggette a scadenza:
+    # vengono mantenute finche' la voce corrispondente e' in cache.
+    cache = {t: v for t, v in cache.items()
+             if t.startswith('__touched__:') or v.get('processed_at', '0') >= cutoff}
     removed = before - len(cache)
     if removed > 0:
         print(f"  moves_cache: {len(cache)} entry ({removed} scadute rimosse)")
@@ -1305,16 +1330,22 @@ def _cleanup_fetch_wikitext_for_titles(titles):
     return result_by_title
 
 
-def _cleanup_check_and_update_pages_batch(pages):
+def _cleanup_check_and_update_pages_batch(pages, moves_cache=None):
     """
     Verifica e aggiorna i metadati di tutte le voci in cache tramite API batch.
     Tre passate:
       1. prop=info (CLEANUP_BATCH_SIZE): rilevamento missing/redirect/NS errato
+         + raccolta campo 'touched' per touched_cache (v9.7.0)
       2. prop=categories (CLEANUP_BATCH_SIZE, con paginazione)
       3. prop=revisions (CLEANUP_BATCH_SIZE_REV): wikitext + timestamp creazione
+         Solo per voci con 'touched' cambiato rispetto all'ultimo run (touched_cache).
+         Al primo run dopo il deploy tutte le voci mancano dalla touched_cache
+         e vengono processate normalmente.
 
     Per ogni voce sopravvissuta: sovrascrive il timestamp con il valore reale
     dall'API (corregge corruzioni da doppia migrazione UTC->IT).
+    moves_cache: se fornito, usato per leggere/scrivere touched_cache
+                 (chiavi '__touched__:<titolo>').
     Restituisce (valid_pages, removed_count).
     """
     n = len(pages)
@@ -1327,6 +1358,7 @@ def _cleanup_check_and_update_pages_batch(pages):
     all_normalized = {}
     all_inv_norm = {}
     survivor_titles = []
+    touched_by_title = {}  # {orig_title: touched_str} raccolto da prop=info
 
     for start in range(0, n, CLEANUP_BATCH_SIZE):
         batch = pages[start:start + CLEANUP_BATCH_SIZE]
@@ -1364,14 +1396,37 @@ def _cleanup_check_and_update_pages_batch(pages):
                 _clog_only(f"  RIMOSSA (NS{page_info.get('ns','?')}): {orig_title}")
             else:
                 survivor_titles.append(orig_title)
+                touched = page_info.get('touched', '')
+                if touched:
+                    touched_by_title[orig_title] = touched
 
     print(f"  Sopravvissute: {len(survivor_titles)}, rimosse: {len(to_remove)}")
+
+    # Filtraggio touched_cache: determina quali voci richiedono revisions
+    # Le voci con touched invariato saltano le chiamate A e B di revisions.
+    if moves_cache is not None:
+        titles_need_rev = []
+        titles_skip_rev = []
+        for title in survivor_titles:
+            touched_now = touched_by_title.get(title, '')
+            cache_key = f'__touched__:{title}'
+            cached_touched = moves_cache.get(cache_key, {}).get('touched', '')
+            if not touched_now or touched_now != cached_touched:
+                titles_need_rev.append(title)
+            else:
+                titles_skip_rev.append(title)
+        print(f"  Touched cache: {len(titles_skip_rev)} voci invariate (skip revisions), "
+              f"{len(titles_need_rev)} voci modificate o nuove (revisions necessarie)")
+    else:
+        titles_need_rev = survivor_titles
+        titles_skip_rev = []
 
     print(f"  Recupero categorie per {len(survivor_titles)} voci...")
     cats_by_title = _cleanup_fetch_categories_for_titles(survivor_titles)
 
-    print(f"  Recupero wikitext e timestamp creazione per {len(survivor_titles)} voci ({CLEANUP_BATCH_SIZE_REV} titoli/chiamata)...")
-    rev_by_title = _cleanup_fetch_wikitext_for_titles(survivor_titles)
+    print(f"  Recupero wikitext e timestamp creazione per {len(titles_need_rev)} voci "
+          f"({CLEANUP_BATCH_SIZE_REV} titoli/chiamata)...")
+    rev_by_title = _cleanup_fetch_wikitext_for_titles(titles_need_rev) if titles_need_rev else {}
 
     batch_by_title = {p['titolo']: p for p in pages}
     ts_fixed_count = 0
@@ -1384,10 +1439,6 @@ def _cleanup_check_and_update_pages_batch(pages):
         if record is None:
             continue
 
-        rev_data = rev_by_title.get(orig_title, {})
-        wikitext = rev_data.get('wikitext', '')
-        creation_ts = rev_data.get('creation_ts', '')
-
         if orig_title in cats_by_title:
             cat_data = cats_by_title[orig_title]
         else:
@@ -1396,6 +1447,27 @@ def _cleanup_check_and_update_pages_batch(pages):
 
         new_cats        = cat_data.get('visible', [])
         new_cats_hidden = cat_data.get('hidden', [])
+
+        if orig_title in titles_skip_rev:
+            # Voce non modificata: aggiorna solo categorie se cambiate,
+            # mantieni wikitext/templates/preview/creation_ts dalla cache.
+            old_cats        = record.get('categorie', [])
+            old_cats_hidden = record.get('categorie_nascoste', [])
+            cats_changed = (set(new_cats) != set(old_cats)
+                            or (not old_cats and bool(new_cats))
+                            or set(new_cats_hidden) != set(old_cats_hidden))
+            if cats_changed:
+                updated = dict(record)
+                updated['categorie']          = new_cats
+                updated['categorie_nascoste'] = new_cats_hidden
+                updated_records[orig_title] = updated
+                _clog_only(f"  AGGIORNATA (categorie): {orig_title}")
+            continue
+
+        # Voce modificata o non ancora in touched_cache: percorso completo
+        rev_data = rev_by_title.get(orig_title, {})
+        wikitext = rev_data.get('wikitext', '')
+        creation_ts = rev_data.get('creation_ts', '')
 
         new_templates = parse_templates_from_wikitext(wikitext)
         new_preview = wikitext[:100].replace('\n', ' ').strip() if wikitext else ''
@@ -1430,6 +1502,19 @@ def _cleanup_check_and_update_pages_batch(pages):
             if tmpls_changed:
                 changes.append('template')
             _clog_only(f"  AGGIORNATA ({', '.join(changes)}): {orig_title}")
+
+        # Aggiorna touched_cache per questa voce
+        if moves_cache is not None:
+            touched_now = touched_by_title.get(orig_title, '')
+            if touched_now:
+                moves_cache[f'__touched__:{orig_title}'] = {'touched': touched_now}
+
+    # Aggiorna touched_cache anche per le voci invariate (touched confermato)
+    if moves_cache is not None:
+        for orig_title in titles_skip_rev:
+            touched_now = touched_by_title.get(orig_title, '')
+            if touched_now:
+                moves_cache[f'__touched__:{orig_title}'] = {'touched': touched_now}
 
     removed_count = len(to_remove)
     valid_pages = []
@@ -1667,12 +1752,14 @@ def _cleanup_save_cache(pages, original_files_count):
             break
 
 
-def run_cleanup_internal(cached_pages, cache_files_count):
+def run_cleanup_internal(cached_pages, cache_files_count, moves_cache=None):
     """
     Esegue le 4 fasi di pulizia cache internamente (ex PuliziaCache.py).
     Restituisce la lista di voci pulita dopo tutte le fasi.
     In DRY_RUN mode le fasi vengono eseguite ma nessuna scrittura avviene:
     al termine viene stampato il report diagnostico invece di salvare.
+    moves_cache: se fornito, viene usato per la touched_cache (ottimizzazione
+    revisions in FASE 3). Le entry __touched__:* vengono aggiornate in-place.
     """
     global _cleanup_log_file
 
@@ -1708,7 +1795,7 @@ def run_cleanup_internal(cached_pages, cache_files_count):
     print("\n" + "=" * 60)
     print("FASE 3: RIMOZIONE VOCI CANCELLATE / AGGIORNAMENTO METADATI")
     print("=" * 60)
-    cached_pages, removed_deleted = _cleanup_check_and_update_pages_batch(cached_pages)
+    cached_pages, removed_deleted = _cleanup_check_and_update_pages_batch(cached_pages, moves_cache=moves_cache)
 
     print("\n" + "=" * 60)
     print("FASE 4: RIMOZIONE VOCI TROPPO VECCHIE")
@@ -2971,8 +3058,13 @@ def main():
     _t2 = datetime.now()
     print(f"  Ora corrente: {_t2.strftime('%H:%M')}")
 
+    # moves_cache caricata qui (anziche' in STEP 4b) per renderla disponibile
+    # alla touched_cache in run_cleanup_internal (ottimizzazione v9.7.0).
+    print("Caricamento moves_cache...")
+    moves_cache = load_moves_cache()
+
     if should_run_cleanup():
-        cached_pages = run_cleanup_internal(cached_pages, cache_files_count)
+        cached_pages = run_cleanup_internal(cached_pages, cache_files_count, moves_cache=moves_cache)
         # Ricostruisci existing_titles dopo la pulizia
         existing_titles = {p['titolo'] for p in cached_pages}
         # Rileggi cache_files_count dopo eventuale modifica della struttura file
@@ -3061,7 +3153,8 @@ def main():
     _t4b = datetime.now()
 
     print("Caricamento moves_cache...")
-    moves_cache = load_moves_cache()
+    # moves_cache gia' caricata in STEP 2; stampa il conteggio aggiornato.
+    print(f"  moves_cache: {len(moves_cache)} entry")
 
     new_pages = get_new_pages_only(existing_titles, cutoff_date, moves_cache)
 
