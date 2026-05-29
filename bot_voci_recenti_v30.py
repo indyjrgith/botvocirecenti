@@ -1,9 +1,31 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.7.1
+Bot VociRecenti v9.8.0
 
 Changelog:
-- v9.7.0: OTTIMIZZAZIONE PRESTAZIONI: riduzione chiamate API revisions in FASE 3 pulizia
+- v9.8.0: OTTIMIZZAZIONE PRESTAZIONI: tre interventi per ridurre il tempo
+        di esecuzione (obiettivo: < 10 minuti).
+        Fix A — DEBUG_MODE: aggiunto flag --debug da riga di comando (simmetrico
+        a --dry-run). Le stampe [DEBUG SKIP existing_titles] in
+        get_moved_to_ns0_since_cutoff (fino a ~1200 righe per run con cache
+        piena) sono ora condizionate a DEBUG_MODE=True. Riduce l'I/O su stdout
+        e sul file di log in ogni run normale.
+        Fix B — Namespace detection senza API in validate_ns_or_manual_page_batch:
+        la funzione chiamava pywikibot.Page(SITE, title) + .namespace() per ogni
+        titolo (9595 titoli nel run di riferimento), potenzialmente triggerando
+        una query API per voce. Ora il namespace viene derivato dal prefisso del
+        titolo tramite NS_PREFIX_MAP, una mappa prefix->ns_id caricata una sola
+        volta all'avvio del bot tramite load_ns_prefix_map() (chiamata subito dopo
+        il login). Fallback a pywikibot.Page() solo per titoli senza prefisso
+        riconoscibile. Risparmio stimato: centinaia di query API eliminate.
+        Fix C — CHIAMATA A parallela in _cleanup_fetch_wikitext_for_titles:
+        il loop titolo-per-titolo per rvdir=newer+rvlimit=1 (non batch-able per
+        vincolo MediaWiki) e' ora eseguito con concurrent.futures.ThreadPoolExecutor
+        (REVISIONS_THREADS=8 worker). Le chiamate sono read-only: nessun rischio
+        di race condition. Con 241 titoli da processare nel run di riferimento,
+        il risparmio atteso e' ~87% del tempo della CHIAMATA A (da ~N*latenza a
+        ~N/8*latenza). REVISIONS_THREADS e' configurabile nel blocco costanti.
+- v9.7.1: OTTIMIZZAZIONE PRESTAZIONI: riduzione chiamate API revisions in FASE 3 pulizia
         e in STEP 4b (nuove voci NS0).
         Problema: sia _cleanup_check_and_update_pages_batch che download_page_data_batch
         chiamavano prop=revisions per TUTTE le voci ad ogni run (CHIAMATA A: una per
@@ -213,6 +235,7 @@ import os
 import sys
 import logging
 import calendar as _calendar
+import concurrent.futures
 
 # ========================================
 # FUSO ORARIO ITALIANO - implementazione robusta senza dipendenze esterne
@@ -304,7 +327,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.7.1'
+VERSION = '9.8.0'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -315,6 +338,11 @@ config.maxthrottle = 2
 # su Wikipedia. Utile per testing senza interrompere il bot in produzione.
 # Puo' essere attivata anche da riga di comando con --dry-run.
 DRY_RUN = False
+
+# --- Modalita' DEBUG ---
+# Se True: stampa messaggi di diagnostica verbose (es. [DEBUG SKIP existing_titles]).
+# Attivabile da riga di comando con --debug.
+DEBUG_MODE = False
 
 # --- Configurazione pulizia automatica ---
 # 'Once'  = una volta per fascia oraria
@@ -344,6 +372,7 @@ CLEANUP_REMOVE_WRONG_NS    = True
 CLEANUP_REMOVE_TOO_OLD     = True
 CLEANUP_BATCH_SIZE         = 50   # titoli per chiamata API (max MediaWiki)
 CLEANUP_BATCH_SIZE_REV     = 20   # titoli per chiamata revisions (wikitext puo' essere grande)
+REVISIONS_THREADS          = 8    # thread paralleli per CHIAMATA A (rvdir=newer, una per titolo)
 CLEANUP_LOG_FILE           = os.path.join(DATA_DIR, 'pulizia_cache.log')
 
 # Controllo voci cancellate/redirect ad ogni run del bot (STEP 3b)
@@ -364,6 +393,45 @@ _LUA_FILE_OVERHEAD = 300  # margine header + struttura file
 
 # Handle globale al file di log della pulizia (usato da log/log_only interni)
 _cleanup_log_file = None
+
+# Mappa prefisso -> namespace_id, caricata all'avvio in load_ns_prefix_map().
+# Usata da validate_ns_or_manual_page_batch per evitare chiamate API per voce.
+# Esempio: {'Utente': 2, 'Discussione': 1, 'Bozza': 118, ...}
+NS_PREFIX_MAP: dict = {}
+
+
+def load_ns_prefix_map():
+    """
+    Carica la mappa prefisso -> namespace_id dal sito MediaWiki.
+    Popola NS_PREFIX_MAP con tutti i namespace e i loro alias canonici
+    e localizzati (es. 'Utente', 'User', 'Bozza', 'Draft', ...).
+    Chiamata una sola volta all'avvio del bot, dopo il login.
+    """
+    global NS_PREFIX_MAP
+    try:
+        ns_map = {}
+        for ns_id, ns_info in SITE.namespaces.items():
+            if ns_id < 0:
+                continue  # Namespace speciali (Media, Special)
+            # ns_info e' un oggetto Namespace con attributi canonical, aliases, custom_name
+            # Aggiungi nome canonico inglese
+            canonical = getattr(ns_info, 'canonical', None)
+            if canonical:
+                ns_map[canonical] = ns_id
+            # Aggiungi nome localizzato (es. 'Utente' per NS2 su it.wiki)
+            custom = getattr(ns_info, 'custom_name', None)
+            if custom:
+                ns_map[custom] = ns_id
+            # Aggiungi alias
+            for alias in getattr(ns_info, 'aliases', []):
+                ns_map[alias] = ns_id
+        NS_PREFIX_MAP = ns_map
+        print(f"  Mappa namespace: {len(NS_PREFIX_MAP)} prefissi caricati "
+              f"(es. Utente={NS_PREFIX_MAP.get('Utente','?')}, "
+              f"Bozza={NS_PREFIX_MAP.get('Bozza','?')})")
+    except Exception as e:
+        print(f"  WARNING: impossibile caricare mappa namespace: {e}")
+        NS_PREFIX_MAP = {}
 
 
 # ========================================
@@ -1258,8 +1326,15 @@ def _cleanup_fetch_wikitext_for_titles(titles):
     result_by_title = {}
     creation_ts_by_title = {}
 
-    # --- CHIAMATA A: timestamp di prima creazione (uno per volta) ---
-    for title in titles:
+    # --- CHIAMATA A: timestamp di prima creazione (parallelizzata) ---
+    # rvdir=newer + rvlimit non sono compatibili con batch multi-titolo
+    # nell'API MediaWiki (invalidparammix), quindi ogni titolo richiede
+    # una chiamata separata. Si eseguono in parallelo con ThreadPoolExecutor
+    # (REVISIONS_THREADS worker) per ridurre la latenza complessiva.
+    # Le chiamate sono read-only: nessun rischio di race condition sui dati.
+
+    def _fetch_creation_ts_single(title):
+        """Worker: recupera il timestamp della prima revisione per un titolo."""
         try:
             result = SITE.simple_request(
                 action='query',
@@ -1272,7 +1347,7 @@ def _cleanup_fetch_wikitext_for_titles(titles):
             ).submit()
         except Exception as e:
             _clog_only(f"  WARNING _fetch_creation_ts '{title}': {e}")
-            continue
+            return title, ''
         query_data = result.get('query', {})
         inv_norm = {n_entry['to']: n_entry['from']
                     for n_entry in query_data.get('normalized', [])}
@@ -1285,9 +1360,16 @@ def _cleanup_fetch_wikitext_for_titles(titles):
                 revisions = page_info.get('revisions', [])
                 if revisions:
                     ts_utc = revisions[0].get('timestamp', '')
-                    creation_ts_by_title[orig_title] = ts_utc_str_to_it(ts_utc) if ts_utc else ''
+                    if ts_utc:
+                        return orig_title, ts_utc_str_to_it(ts_utc)
             except Exception:
                 pass
+        return title, ''
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=REVISIONS_THREADS) as executor:
+        for orig_title, ts_it in executor.map(_fetch_creation_ts_single, titles):
+            if ts_it:
+                creation_ts_by_title[orig_title] = ts_it
 
     # --- CHIAMATA B: wikitext corrente (batch, nessun parametro incompatibile) ---
     for start in range(0, len(titles), CLEANUP_BATCH_SIZE_REV):
@@ -2249,28 +2331,57 @@ def validate_ns_or_manual_page_batch(titles, existing_titles, cutoff_date, moves
     Valida una lista di titoli (da NS non-0 o da CacheMoved manuale) usando
     chiamate API batch invece di chiamate singole.
     Restituisce (pages_valide, dict_skip_reason).
+
+    Ottimizzazione v9.8.0: il namespace del titolo sorgente viene determinato
+    tramite NS_PREFIX_MAP (caricata all'avvio) invece di costruire pywikibot.Page()
+    e chiamare .namespace() per ogni titolo (che puo' triggerare una query API).
+    Fallback a pywikibot.Page() solo per titoli senza prefisso riconoscibile.
     """
     if not titles:
         return [], {}
 
     now_str = now_it().strftime('%Y%m%d%H%M%S')
-    # Risolvi titoli NS0 da titoli non-NS0
     ns0_map = {}   # ns0_title -> original_title
     skip_reasons = {}
 
     for title in titles:
-        try:
-            temp_page = pywikibot.Page(SITE, title)
-            original_ns = temp_page.namespace()
-            if original_ns == 0:
-                ns0_title = temp_page.title()
-            else:
-                base_name = temp_page.title(with_ns=False)
+        # --- Determinazione namespace e ns0_title senza API ---
+        # Prova prima con NS_PREFIX_MAP: se il titolo ha un prefisso "Prefisso:"
+        # noto nella mappa, il namespace e' determinabile senza query.
+        ns0_title = None
+        original_ns = None
+
+        colon_pos = title.find(':')
+        if colon_pos > 0 and NS_PREFIX_MAP:
+            prefix = title[:colon_pos]
+            if prefix in NS_PREFIX_MAP:
+                original_ns = NS_PREFIX_MAP[prefix]
+                base_name = title[colon_pos + 1:]
+                # Rimuovi eventuale path interno (es. "Utente:Foo/SandboxBar" -> "SandboxBar")
                 if '/' in base_name:
                     base_name = base_name.split('/')[-1]
-                ns0_title = pywikibot.Page(SITE, base_name, ns=0).title()
-        except Exception as e:
-            skip_reasons[title] = f'error: {e}'
+                base_name = base_name.strip()
+                if base_name:
+                    ns0_title = base_name
+
+        # Fallback: prefisso non in mappa o titolo senza prefisso -> usa pywikibot.Page()
+        if ns0_title is None or original_ns is None:
+            try:
+                temp_page = pywikibot.Page(SITE, title)
+                original_ns = int(temp_page.namespace())
+                if original_ns == 0:
+                    ns0_title = temp_page.title()
+                else:
+                    base_name = temp_page.title(with_ns=False)
+                    if '/' in base_name:
+                        base_name = base_name.split('/')[-1]
+                    ns0_title = pywikibot.Page(SITE, base_name, ns=0).title()
+            except Exception as e:
+                skip_reasons[title] = f'error: {e}'
+                continue
+
+        if not ns0_title:
+            skip_reasons[title] = 'error: ns0_title vuoto'
             continue
 
         if ns0_title in existing_titles:
@@ -2789,7 +2900,8 @@ def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
                 if not target_title:
                     continue
                 if target_title in existing_titles:
-                    print(f"    [DEBUG SKIP existing_titles] target='{target_title}'")
+                    if DEBUG_MODE:
+                        print(f"    [DEBUG SKIP existing_titles] target='{target_title}'")
                     continue
                 cached = moves_cache.get(target_title)
                 if cached and cached.get('result') == 'rejected':
@@ -3079,11 +3191,13 @@ def _fmt_elapsed(seconds):
 
 
 def main():
-    global DRY_RUN
+    global DRY_RUN, DEBUG_MODE
 
-    # Supporto flag --dry-run da riga di comando
+    # Supporto flag --dry-run e --debug da riga di comando
     if '--dry-run' in sys.argv:
         DRY_RUN = True
+    if '--debug' in sys.argv:
+        DEBUG_MODE = True
 
     tee = setup_log()
 
@@ -3107,6 +3221,7 @@ def main():
     if AutoClean == 'Once':
         print(f"  Fascia pulizia:     {AutoCleanTimeBegin} - {AutoCleanTimeEnd}")
     print(f"  DRY_RUN:            {DRY_RUN}")
+    print(f"  DEBUG_MODE:         {DEBUG_MODE}")
     print(f"  CacheMoved:         {CACHE_MOVED_PAGE} (scansione NS: {NS_SCAN})")
     print(f"  Cache parsed flag:  {CACHE_PARSED_PAGE}")
 
@@ -3123,6 +3238,11 @@ def main():
         print(f"ERRORE login: {e}")
         tee.close()
         return
+
+    # Carica mappa namespace una sola volta, dopo il login
+    print("Caricamento mappa namespace...")
+    load_ns_prefix_map()
+    print()
 
     # ----------------------------------------
     # STEP 1: Carica cache esistente
