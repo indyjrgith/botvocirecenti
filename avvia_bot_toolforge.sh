@@ -1,25 +1,33 @@
 #!/bin/bash
-# avvia_bot_toolforge.sh - Launcher bot VociRecenti per Toolforge
+# avvia_bot_toolforge.sh - Launcher bot per Toolforge (multi-bot)
 # Uso:
-#   ./avvia_bot_toolforge.sh              -> chiede conferma e lancia subito (one-off)
-#   ./avvia_bot_toolforge.sh 2m           -> ogni ora, a partire da +2 minuti da adesso
-#   ./avvia_bot_toolforge.sh 12m          -> ogni ora, al minuto (attuale+12)%60
-#   ./avvia_bot_toolforge.sh 0h12m        -> ogni ora, al minuto 12
-#   ./avvia_bot_toolforge.sh 2h15m        -> ogni 2 ore, al minuto 15
-#   ./avvia_bot_toolforge.sh stop         -> ferma il bot in modo sicuro (attende fine scrittura cache)
-#   ./avvia_bot_toolforge.sh logs         -> monitora i log in tempo reale
+#   ./avvia_bot_toolforge.sh [script.py]                 -> chiede conferma e lancia subito (one-off)
+#   ./avvia_bot_toolforge.sh [script.py] 2m               -> ogni ora, a partire da +2 minuti da adesso
+#   ./avvia_bot_toolforge.sh [script.py] 12m              -> ogni ora, al minuto (attuale+12)%60
+#   ./avvia_bot_toolforge.sh [script.py] 0h12m            -> ogni ora, al minuto 12
+#   ./avvia_bot_toolforge.sh [script.py] 2h15m            -> ogni 2 ore, al minuto 15
+#   ./avvia_bot_toolforge.sh [script.py] stop             -> ferma il bot in modo sicuro
+#   ./avvia_bot_toolforge.sh [script.py] logs             -> monitora i log in tempo reale
+#
+# Se [script.py] viene omesso, si usa bot_voci_recenti_v30.py per
+# retrocompatibilita' (comportamento storico di questo script).
+#
+# Esempi:
+#   ./avvia_bot_toolforge.sh bot_voci_recenti_v30.py 0h0m   -> bot principale, ogni ora al minuto 0
+#   ./avvia_bot_toolforge.sh ArchiviaVociRecenti.py 0h30m   -> secondo bot, ogni ora al minuto 30
+#   ./avvia_bot_toolforge.sh ArchiviaVociRecenti.py stop    -> ferma solo ArchiviaVociRecenti.py
+#   ./avvia_bot_toolforge.sh stop                           -> ferma bot_voci_recenti_v30.py (default)
 
 # ============================================================
 # CONFIGURAZIONE
 # ============================================================
-BOT_SCRIPT="bot_voci_recenti_v30.py"
+DEFAULT_SCRIPT="bot_voci_recenti_v30.py"
 BOT_IMAGE="tool-botvocirecenti/tool-botvocirecenti:latest"
-JOB_NAME="botvocirecenti"
-JOB_NAME_ONEOFF="bot-oneoff"
 CACHE_PAGE="Modulo:VociRecenti/Dati1"
 WIKI_API="https://it.wikipedia.org/w/api.php"
 SAFE_STOP_THRESHOLD=300   # secondi: se Dati1 è stato modificato meno di 5 minuti fa, il bot sta scrivendo
 SAFE_STOP_POLL=30         # secondi: intervallo di controllo
+GENERIC_SAFE_STOP_MAX_WAIT=1200   # secondi: tetto di attesa per il controllo generico, oltre il quale si chiede conferma manuale
 # ============================================================
 
 # Colori
@@ -28,6 +36,35 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
+
+# ------------------------------------------------------------
+# Funzione: calcola il nome del job Toolforge (schedulato) per uno
+# script dato. bot_voci_recenti_v30.py mantiene il nome storico
+# 'botvocirecenti' per non orfanizzare il job cron gia' installato
+# in produzione. Per qualunque altro script si genera uno slug
+# automatico dal nome file (minuscolo, senza .py, solo alfanumerici).
+# ------------------------------------------------------------
+job_name_for_script() {
+    local script="$1"
+    if [ "$script" = "$DEFAULT_SCRIPT" ]; then
+        echo "botvocirecenti"
+    else
+        echo "${script%.py}" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]'
+    fi
+}
+
+# ------------------------------------------------------------
+# Funzione: calcola il nome del job Toolforge one-off per uno
+# script dato (stessa logica di job_name_for_script).
+# ------------------------------------------------------------
+oneoff_name_for_script() {
+    local script="$1"
+    if [ "$script" = "$DEFAULT_SCRIPT" ]; then
+        echo "bot-oneoff"
+    else
+        echo "$(job_name_for_script "$script")-oneoff"
+    fi
+}
 
 # ------------------------------------------------------------
 # Funzione: lancia il bot una volta sola
@@ -65,7 +102,7 @@ install_schedule() {
         cron_expr="${cron_min} */${cron_every_h} * * *"
     fi
 
-    echo -e "${CYAN}Configurazione job schedulato...${NC}"
+    echo -e "${CYAN}Configurazione job schedulato per ${BOT_SCRIPT}...${NC}"
     echo -e "  Espressione cron: ${YELLOW}${cron_expr}${NC}"
 
     # Rimuovi job schedulato esistente
@@ -131,8 +168,10 @@ show_logs() {
 # ------------------------------------------------------------
 # Funzione: attende che il bot abbia finito di scrivere la cache
 # Controlla il timestamp dell'ultima modifica di Dati1 su Wikipedia
+# Specifica per bot_voci_recenti_v30.py (unico script che scrive
+# la pagina cache Modulo:VociRecenti/Dati1).
 # ------------------------------------------------------------
-wait_for_safe_stop() {
+wait_for_safe_stop_cache() {
     echo -e "${CYAN}Controllo stato scrittura cache...${NC}"
     echo -e "  Pagina monitorata: ${YELLOW}${CACHE_PAGE}${NC}"
 
@@ -173,12 +212,81 @@ wait_for_safe_stop() {
 }
 
 # ------------------------------------------------------------
+# Funzione: attende che un job generico (qualunque script diverso
+# da bot_voci_recenti_v30.py) non risulti piu' "in esecuzione" prima
+# di essere fermato, per non interrompere un salvataggio a meta'
+# (rischio di scrittura parziale su Wikipedia).
+#
+# NOTA: il parsing si basa sull'output testuale di `toolforge jobs
+# show`, il cui formato esatto puo' variare. Alla prima esecuzione
+# su un nuovo script conviene verificare a mano con:
+#   toolforge jobs show <job_name>
+# che la riga di stato contenga la parola "running" (case-insensitive)
+# quando il job e' effettivamente attivo. In caso di dubbio o output
+# non riconosciuto, la funzione resta prudente e continua ad attendere
+# piuttosto che procedere con lo stop.
+# ------------------------------------------------------------
+wait_for_safe_stop_generic() {
+    local job_name="$1"
+    local waited=0
+
+    echo -e "${CYAN}Controllo stato job '${job_name}' su Toolforge...${NC}"
+
+    while true; do
+        local show_output
+        show_output=$(toolforge jobs show "$job_name" 2>/dev/null)
+
+        if [ -z "$show_output" ]; then
+            echo -e "  ${GREEN}Job '${job_name}' non trovato/nessuna esecuzione attiva — sicuro procedere con lo stop.${NC}"
+            break
+        fi
+
+        if echo "$show_output" | grep -iq "running"; then
+            if [ "$waited" -ge "$GENERIC_SAFE_STOP_MAX_WAIT" ]; then
+                echo -e "  ${RED}Attesa massima (${GENERIC_SAFE_STOP_MAX_WAIT}s) superata: il job risulta ancora in esecuzione.${NC}"
+                echo -n "  Forzare comunque lo stop? [s/N] "
+                read -r risposta_forza
+                case "$risposta_forza" in
+                    [sS]|[yY])
+                        break
+                        ;;
+                    *)
+                        echo "  Continuo ad attendere..."
+                        waited=0
+                        ;;
+                esac
+                continue
+            fi
+            echo -e "  ${YELLOW}Job '${job_name}' risulta in esecuzione. Attendo ${SAFE_STOP_POLL}s...${NC}"
+            sleep "$SAFE_STOP_POLL"
+            waited=$(( waited + SAFE_STOP_POLL ))
+        else
+            echo -e "  ${GREEN}Job '${job_name}' non risulta in esecuzione — sicuro procedere con lo stop.${NC}"
+            break
+        fi
+    done
+}
+
+# ------------------------------------------------------------
+# Funzione: sceglie il controllo di sicurezza corretto in base
+# allo script (cache dedicata per il bot principale, controllo
+# generico via `toolforge jobs show` per tutti gli altri).
+# ------------------------------------------------------------
+wait_for_safe_stop() {
+    if [ "$BOT_SCRIPT" = "$DEFAULT_SCRIPT" ]; then
+        wait_for_safe_stop_cache
+    else
+        wait_for_safe_stop_generic "$JOB_NAME"
+    fi
+}
+
+# ------------------------------------------------------------
 # Funzione: ferma il bot in modo sicuro
 # ------------------------------------------------------------
 stop_schedule() {
-    echo -e "${CYAN}Arresto job schedulato '${JOB_NAME}'...${NC}"
+    echo -e "${CYAN}Arresto job schedulato '${JOB_NAME}' (script: ${BOT_SCRIPT})...${NC}"
 
-    # Attendi che il bot finisca di scrivere la cache
+    # Attendi che il bot finisca di scrivere/salvare
     wait_for_safe_stop
 
     # Elimina il job schedulato
@@ -240,6 +348,17 @@ parse_param() {
 # MAIN
 # ============================================================
 
+# --- Determina quale script lanciare (se specificato) ---
+if [[ "$1" == *.py ]]; then
+    BOT_SCRIPT="$1"
+    shift
+else
+    BOT_SCRIPT="$DEFAULT_SCRIPT"
+fi
+
+JOB_NAME="$(job_name_for_script "$BOT_SCRIPT")"
+JOB_NAME_ONEOFF="$(oneoff_name_for_script "$BOT_SCRIPT")"
+
 # --- logs: mostra i log in tempo reale ---
 if [ "$1" = "logs" ]; then
     show_logs
@@ -248,8 +367,8 @@ fi
 
 # --- stop: ferma il job schedulato ---
 if [ "$1" = "stop" ]; then
-    echo -e "${CYAN}=== Bot VociRecenti — Arresto ===${NC}"
-    echo -n "Confermi l'arresto del job schedulato? [s/N] "
+    echo -e "${CYAN}=== Bot ${BOT_SCRIPT} — Arresto ===${NC}"
+    echo -n "Confermi l'arresto del job schedulato '${JOB_NAME}'? [s/N] "
     read -r risposta
     case "$risposta" in
         [sS]|[yY])
@@ -263,10 +382,10 @@ if [ "$1" = "stop" ]; then
     exit 0
 fi
 
-# --- Nessun parametro: lancio immediato ---
+# --- Nessun parametro rimanente: lancio immediato ---
 if [ $# -eq 0 ]; then
-    echo -e "${CYAN}=== Bot VociRecenti ===${NC}"
-    echo -e "Nessun parametro — lancio immediato (esecuzione singola)."
+    echo -e "${CYAN}=== Bot ${BOT_SCRIPT} ===${NC}"
+    echo -e "Nessun parametro di schedulazione — lancio immediato (esecuzione singola)."
     echo -n "Confermi? [s/N] "
     read -r risposta
     case "$risposta" in
@@ -282,7 +401,7 @@ if [ $# -eq 0 ]; then
 fi
 
 # --- Parametro presente: configura job schedulato ---
-echo -e "${CYAN}=== Bot VociRecenti — Configurazione schedulazione ===${NC}"
+echo -e "${CYAN}=== Bot ${BOT_SCRIPT} — Configurazione schedulazione ===${NC}"
 parse_param "$1"
 echo -e "  Parametro:   ${YELLOW}$1${NC}"
 echo -e "  Minuto cron: ${YELLOW}${PARSED_MIN}${NC}"
