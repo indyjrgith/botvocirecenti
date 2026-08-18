@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bot ArchiviaVociRecenti v1.1.6
+Bot ArchiviaVociRecenti v1.2.2
 
 Scansiona tutte le transclusioni di Template:ArchiviaVociRecenti, e per
 ogni pagina sorgente che lo include: se e' ora di archiviare, "subst-a"
@@ -46,6 +46,35 @@ Changelog:
         process_page, main) e il secondo 'if __name__'. Risolve il
         NameError su source_instance_blocks e la doppia esecuzione del
         bot ad ogni lancio.
+- v1.2.0: Refactoring dell'accoppiamento sezione sorgente <-> sezione
+        archiviata: rimossa la logica basata sulle intestazioni di livello
+        2 (source_instance_blocks/section_key/split_archive_sections/
+        merge_instance_section/merge_structured_archive, introdotte in
+        v1.1.3), causa di fallimenti dell'archiviazione al minimo cambio
+        di intestazione o in assenza di intestazioni. Sostituita con
+        marcatori HTML a hash (<!-- ArchiviaVociRecenti:sezione:HASH -->)
+        piazzati prima del testo grezzo che precede ciascuna istanza
+        VociRecenti: l'hash e' calcolato su quel testo grezzo, quindi
+        qualunque modifica dell'etichetta (anche minima) fa si' che la
+        sezione archiviata resti intatta dov'e' (mai cancellata) e ne
+        venga creata una nuova con il testo aggiornato. Se l'archivio non
+        contiene alcun marcatore riconoscibile e non e' vuoto, il bot non
+        modifica la pagina e segnala una volta in talk; testo estraneo
+        prima del primo marcatore viene invece preservato cosi' com'e' e
+        non blocca l'elaborazione delle sezioni riconosciute.
+- v1.2.2: Fix di find_balanced_template_end: contava ogni singola '{' e
+        '}' invece delle sole coppie doppie '{{'/'}}' che delimitano
+        davvero un template per MediaWiki. Un valore di parametro con una
+        graffa singola isolata (es. una regexp con '%{...}') veniva quindi
+        interpretato erroneamente come apertura di un livello di
+        annidamento mai richiuso, facendo scartare l'intera istanza come
+        "non bilanciata" pur essendo perfettamente valida per il wiki; il
+        suo testo grezzo restava cosi' visibile, non espanso, nell'
+        etichetta della sezione archiviata successiva. Riscritta la
+        funzione per contare solo le coppie '{{'/'}}' (avanzando di 2
+        caratteri quando trovate, di 1 sulle graffe singole isolate); il
+        rilevamento di squilibri genuini (es. un template annidato aperto
+        e mai chiuso) resta invariato.
 """
 
 import pywikibot
@@ -54,6 +83,7 @@ from datetime import datetime, timedelta
 import re
 import os
 import sys
+import hashlib
 import calendar as _calendar
 
 # ========================================
@@ -121,11 +151,16 @@ DEFAULT_HEADING = '== Archiviazione eseguita il %d =='
 BOT_START_MARKER = '<!-- INIZIO ELENCO BOT -->'
 BOT_END_MARKER = '<!-- FINE ELENCO BOT -->'
 
+# Marcatore per sezione (accoppiamento a hash fra istanza sorgente e
+# sezione archiviata). Vedi build_source_instances/merge_marker_sections.
+SECTION_MARKER_PREFIX = '<!-- ArchiviaVociRecenti:sezione:'
+SECTION_MARKER_SUFFIX = ' -->'
+
 ARCHIVE_MAX_CHARS = 1_500_000
 
 SAVE_CONFLICT_RETRIES = 2
 
-VERSION = '1.1.6'
+VERSION = '1.2.2'
 
 config.put_throttle = 1
 config.minthrottle = 0
@@ -258,18 +293,28 @@ def find_balanced_template_end(text, start):
     """
     Partendo da start (posizione della prima '{' di '{{'), trova la
     posizione subito dopo la '}' di chiusura bilanciata.
+
+    Conta esclusivamente le COPPIE doppie '{{' / '}}' (i veri delimitatori
+    di template per MediaWiki), non le singole graffe isolate: un valore
+    di parametro che contiene una '{' o '}' solitaria (es. una regexp con
+    '%{...}' o simili) e' testo letterale per il parser del wiki e non
+    deve alterare il livello di annidamento, altrimenti template
+    perfettamente validi verrebbero scartati come "non bilanciati".
     """
     level = 0
     i = start
     n = len(text)
-    while i < n:
-        c = text[i]
-        if c == '{':
+    while i < n - 1:
+        if text[i] == '{' and text[i + 1] == '{':
             level += 1
-        elif c == '}':
+            i += 2
+            continue
+        if text[i] == '}' and text[i + 1] == '}':
             level -= 1
+            i += 2
             if level == 0:
-                return i + 1
+                return i
+            continue
         i += 1
     return None
 
@@ -285,30 +330,41 @@ def _template_open_re(template_name):
     return rx
 
 
-def find_template_span(text, template_name, start=0):
-    """Trova la prima istanza di {{template_name...}} da start in poi.
-    Restituisce (start, end) oppure None."""
-    m = _template_open_re(template_name).search(text, start)
-    if not m:
-        return None
-    open_pos = m.start()
-    end = find_balanced_template_end(text, open_pos)
-    if end is None:
-        return None
-    return (open_pos, end)
+def find_all_template_spans_ex(text, template_name):
+    """
+    Come find_all_template_spans, ma restituisce anche il numero di
+    occorrenze scartate perche' con graffe non bilanciate (tipicamente un
+    bug nella sorgente: un valore di parametro che contiene una '{' senza
+    la '}' corrispondente). Un'occorrenza del genere viene saltata SENZA
+    interrompere la scansione, cosi' da non perdere le istanze successive
+    valide: prima del fix, un'unica istanza malformata faceva sparire
+    silenziosamente tutte quelle dopo di essa nella pagina.
+    """
+    spans = []
+    n_skipped = 0
+    pos = 0
+    open_re = _template_open_re(template_name)
+    while True:
+        m = open_re.search(text, pos)
+        if not m:
+            break
+        open_pos = m.start()
+        end = find_balanced_template_end(text, open_pos)
+        if end is None:
+            n_skipped += 1
+            pos = m.end()
+            continue
+        spans.append((open_pos, end))
+        pos = end
+    return spans, n_skipped
 
 
 def find_all_template_spans(text, template_name):
     """Trova tutte le istanze di {{template_name...}} nel testo, in
-    ordine di apparizione."""
-    spans = []
-    pos = 0
-    while True:
-        span = find_template_span(text, template_name, pos)
-        if span is None:
-            break
-        spans.append(span)
-        pos = span[1]
+    ordine di apparizione. Le istanze con graffe non bilanciate vengono
+    saltate silenziosamente; usare find_all_template_spans_ex per essere
+    avvisati di eventuali scarti."""
+    spans, _ = find_all_template_spans_ex(text, template_name)
     return spans
 
 
@@ -394,6 +450,7 @@ def validate_archivia_params(params):
             if str(giorni) != giorni_raw or not (MIN_GIORNI <= giorni <= MAX_GIORNI):
                 raise ValueError
         except ValueError:
+            result['pagina'] = pagina  # titolo comunque valido/risolvibile
             result['errore'] = (
                 f'Errore: il numero dei giorni deve essere compreso fra '
                 f'{MIN_GIORNI} e {MAX_GIORNI}'
@@ -445,6 +502,211 @@ def dedup_instance_lines(lines):
         seen.add(key)
         result.append(line)
     return result
+
+
+# ========================================
+# MARCATORI A HASH PER SEZIONE
+#
+# Ogni istanza {{VociRecenti}} della sorgente e' preceduta da testo grezzo
+# (etichetta: es. un titolo di sezione, un grassetto...). Quel testo grezzo
+# viene hashato per ottenere un id stabile che accoppia l'istanza sorgente
+# alla sezione corrispondente gia' archiviata, indipendentemente da
+# eventuali riordini altrove nella pagina. Se il testo grezzo cambia anche
+# di poco, l'hash cambia: la vecchia sezione archiviata resta intatta
+# (Caso B, mai cancellata) e ne viene creata una nuova (Caso A).
+# ========================================
+
+SECTION_MARKER_RE = re.compile(
+    re.escape(SECTION_MARKER_PREFIX) + r'([0-9a-f]{10}(?:-\d+)?)' + re.escape(SECTION_MARKER_SUFFIX)
+)
+
+
+def section_marker(marker_id):
+    return f'{SECTION_MARKER_PREFIX}{marker_id}{SECTION_MARKER_SUFFIX}'
+
+
+def compute_instance_labels(text, spans_a, spans_v):
+    """
+    Restituisce, nell'ordine della sorgente, il testo grezzo che precede
+    ciascuna istanza VociRecenti: dalla fine dell'istanza precedente (o
+    dalla fine della prima istanza di ArchiviaVociRecenti, per la prima
+    VociRecenti) fino all'inizio dell'istanza corrente.
+    """
+    labels = []
+    prev_end = spans_a[0][1] if spans_a else 0
+    for (s, e) in spans_v:
+        labels.append(text[prev_end:s])
+        prev_end = e
+    return labels
+
+
+def compute_section_marker_ids(labels):
+    """
+    Calcola l'id marcatore (10 caratteri esadecimali di uno sha256) per
+    ciascuna etichetta, nell'ordine della sorgente. Se piu' istanze
+    condividono la stessa identica etichetta (caso raro), l'id viene
+    disambiguato aggiungendo l'indice di occorrenza di quell'etichetta
+    ripetuta (non l'indice assoluto dell'istanza), cosi' che un
+    inserimento/rimozione altrove nella pagina non comprometta
+    l'accoppiamento di queste istanze.
+    """
+    total_by_label = {}
+    for label in labels:
+        total_by_label[label] = total_by_label.get(label, 0) + 1
+
+    occurrence_counts = {}
+    ids = []
+    for label in labels:
+        h = hashlib.sha256(label.encode('utf-8')).hexdigest()[:10]
+        if total_by_label[label] > 1:
+            occ = occurrence_counts.get(label, 0)
+            occurrence_counts[label] = occ + 1
+            ids.append(f'{h}-{occ}')
+        else:
+            ids.append(h)
+    return ids
+
+
+def build_source_instances(text, spans_a, spans_v, expanded_by_index):
+    """
+    Costruisce, per ogni istanza VociRecenti della sorgente, l'etichetta
+    (testo grezzo che la precede), il marcatore a hash corrispondente e le
+    voci (deduplicate esclusivamente all'interno della singola istanza).
+    """
+    labels = compute_instance_labels(text, spans_a, spans_v)
+    marker_ids = compute_section_marker_ids(labels)
+
+    instances = []
+    for idx in range(len(spans_v)):
+        instances.append({
+            'marker_id': marker_ids[idx],
+            'label': labels[idx],
+            'lines': dedup_instance_lines(expanded_by_index[idx]),
+        })
+    return instances
+
+
+def parse_marker_sections(block_text):
+    """
+    Analizza il blocco bot esistente dell'archivio individuando i
+    marcatori di sezione. Restituisce (ok, preamble, sections):
+      - ok=False: nessun marcatore presente e il blocco non e' vuoto ->
+        struttura non riconoscibile (Caso C), nessuna corrispondenza
+        possibile con la sorgente.
+      - preamble: testo eventualmente presente prima del primo marcatore.
+        Viene preservato COSI' COM'E' in cima al blocco ricostruito (mai
+        validato ne' cancellato): se in una pagina di archivio esiste
+        anche solo una porzione con marcatori riconoscibili, quella
+        porzione viene comunque elaborata normalmente.
+      - sections: lista ordinata di dict {marker_id, body}, dove body e'
+        tutto il testo (etichetta + voci) fino al marcatore successivo o
+        alla fine del blocco.
+    """
+    matches = list(SECTION_MARKER_RE.finditer(block_text))
+
+    if not matches:
+        if block_text.strip():
+            return False, '', []
+        return True, '', []
+
+    preamble = block_text[:matches[0].start()]
+    sections = []
+    for i, m in enumerate(matches):
+        body_end = matches[i + 1].start() if i + 1 < len(matches) else len(block_text)
+        sections.append({
+            'marker_id': m.group(1),
+            'body': block_text[m.end():body_end],
+        })
+    return True, preamble, sections
+
+
+def append_new_entries(existing_body, new_lines):
+    """
+    Aggiunge in fondo al corpo di una sezione esistente (dopo l'ultima
+    voce, prima del marcatore successivo) solo le voci nuove non ancora
+    presenti; non tocca il contenuto preesistente (etichetta + voci gia'
+    archiviate, anche se modificato manualmente).
+    """
+    existing_lines = extract_voci(existing_body)
+    existing_keys = {voce_key(line) for line in existing_lines}
+
+    to_append = []
+    for line in new_lines:  # gia' deduplicate internamente all'istanza
+        key = voce_key(line)
+        if key in existing_keys:
+            continue
+        to_append.append(line)
+        existing_keys.add(key)
+
+    if not to_append:
+        return existing_body, 0
+
+    body = existing_body
+    if body and not body.endswith('\n'):
+        body += '\n'
+    body += '\n'.join(to_append) + '\n'
+    return body, len(to_append)
+
+
+def merge_marker_sections(existing_block_text, source_instances):
+    """
+    Fonde le nuove voci nell'archivio esistente accoppiando le sezioni
+    tramite i marcatori a hash.
+
+    - Marcatore esistente combacia con un'istanza sorgente: la sezione
+      esistente e' preservata cosi' com'e' e solo le voci nuove vengono
+      aggiunte in fondo (aggiornamento).
+    - Nessun marcatore combacia: nuova sezione creata da zero, tutte le
+      voci trattate come nuove (Caso A).
+    - Marcatore esistente senza corrispondenza nella sorgente attuale:
+      sezione conservata intatta in fondo, nell'ordine originale
+      dell'archivio (Caso B, mai cancellata).
+
+    Restituisce (merged_block, n_new, ok). ok=False indica struttura non
+    riconoscibile (Caso C): il chiamante non deve modificare l'archivio.
+    """
+    ok, preamble, existing_sections = parse_marker_sections(existing_block_text)
+    if not ok:
+        return None, 0, False
+
+    existing_by_id = {sec['marker_id']: sec for sec in existing_sections}
+    used_ids = set()
+
+    output_parts = [preamble] if preamble else []
+    total_new = 0
+
+    # NB: 'body' include SEMPRE la propria interruzione di riga iniziale
+    # (che separa il marcatore dal contenuto). Il marcatore viene quindi
+    # concatenato al body senza aggiungere un proprio '\n': se lo si
+    # aggiungesse qui, verrebbe "catturato" dentro il body al successivo
+    # parse_marker_sections e ri-aggiunto ad ogni ciclo, accumulando righe
+    # vuote a ogni archiviazione successiva.
+    for inst in source_instances:
+        marker_id = inst['marker_id']
+        existing_sec = existing_by_id.get(marker_id)
+
+        if existing_sec is not None:
+            used_ids.add(marker_id)
+            body, n_new = append_new_entries(existing_sec['body'], inst['lines'])
+        else:
+            label = inst['label']
+            body = label if label.startswith('\n') else '\n' + label
+            if not body.endswith('\n'):
+                body += '\n'
+            if inst['lines']:
+                body += '\n'.join(inst['lines']) + '\n'
+            n_new = len(inst['lines'])
+
+        total_new += n_new
+        output_parts.append(section_marker(marker_id) + body)
+
+    # Sezioni dell'archivio non piu' presenti nella sorgente attuale:
+    # conservate intatte in fondo, nell'ordine originale dell'archivio.
+    for sec in existing_sections:
+        if sec['marker_id'] not in used_ids:
+            output_parts.append(section_marker(sec['marker_id']) + sec['body'])
+
+    return ''.join(output_parts), total_new, True
 
 
 def build_heading(intestazione_param, data_it):
@@ -629,38 +891,65 @@ def process_page(page):
         return
 
     # 1. Trova tutte le istanze di ArchiviaVociRecenti; usa solo la prima.
-    spans_a = find_all_template_spans(text, 'ArchiviaVociRecenti')
+    #    (le istanze con graffe sbilanciate vengono scartate da find_
+    #    all_template_spans_ex; qui l'avviso puo' andare solo sulla talk
+    #    della pagina sorgente, dato che l'archivio non e' ancora noto)
+    spans_a, n_skipped_a = find_all_template_spans_ex(text, 'ArchiviaVociRecenti')
     if not spans_a:
         print("  Nessuna istanza del template trovata (inatteso), skip.")
         return
 
-    if len(spans_a) > 1:
+    if n_skipped_a:
         post_talk_notice_once(
-            page, 'istanza-multipla',
-            "Errore: piu' istanze del template di archiviazione nella "
-            "pagina. Verra' considerata solo la prima."
+            page, 'istanza-archiviavocirecenti-non-bilanciata',
+            "Errore: una o piu' istanze del template di archiviazione "
+            "hanno graffe non bilanciate (probabile errore in un valore "
+            "di parametro) e sono state ignorate dal bot."
         )
 
     raw_a = text[spans_a[0][0]:spans_a[0][1]]
     params = parse_params(raw_a)
     v = validate_archivia_params(params)
 
+    # Da qui in avanti, se il titolo della pagina di archivio e'
+    # risolvibile, tutti gli avvisi del bot vanno sulla SUA talk (non su
+    # quella della pagina sorgente): e' li' che chi la gestisce guarda.
+    notice_page = pywikibot.Page(SITE, v['pagina']) if v['pagina'] else page
+
     if not v['ok']:
-        post_talk_notice_once(page, 'parametri-non-validi', v['errore'])
+        post_talk_notice_once(notice_page, 'parametri-non-validi', v['errore'])
         print(f"  Parametri non validi: {v['errore']}")
         return
 
+    if len(spans_a) > 1:
+        post_talk_notice_once(
+            notice_page, 'istanza-multipla',
+            "Errore: piu' istanze del template di archiviazione nella "
+            "pagina. Verra' considerata solo la prima."
+        )
+
     # 3. Trova tutte le istanze di VociRecenti.
-    spans_v = find_all_template_spans(text, 'VociRecenti')
+    spans_v, n_skipped_v = find_all_template_spans_ex(text, 'VociRecenti')
+
+    if n_skipped_v:
+        post_talk_notice_once(
+            notice_page, 'istanza-vocirecenti-non-bilanciata',
+            "Errore: una o piu' istanze di VociRecenti hanno graffe non "
+            "bilanciate (probabile errore in un valore di parametro, es. "
+            "una '{' senza '}' corrispondente) e sono state ignorate dal "
+            "bot; le istanze successive nella pagina sono state comunque "
+            "elaborate normalmente."
+        )
+
     if not spans_v:
         post_talk_notice_once(
-            page, 'manca-vocirecenti',
+            notice_page, 'manca-vocirecenti',
             "Errore: Template VociRecenti non presente nella pagina."
         )
         print("  Nessuna istanza di VociRecenti trovata, skip archiviazione.")
         return
 
-    archive_page = pywikibot.Page(SITE, v['pagina'])
+    archive_page = notice_page
 
     # 4. Decide se e' ora di archiviare.
     if not should_archive(archive_page, v['giorni'], v['forza']):
@@ -684,7 +973,7 @@ def process_page(page):
 
     if any_instance_error:
         post_talk_notice_once(
-            page, 'istanza-in-errore',
+            archive_page, 'istanza-in-errore',
             "Attenzione: una o piu' istanze di VociRecenti hanno prodotto "
             "un errore durante l'espansione; le voci corrispondenti non "
             "sono state archiviate. Le altre istanze, se valide, sono "
@@ -698,9 +987,10 @@ def process_page(page):
     data_it = now_it().strftime('%d/%m/%Y')
     heading = build_heading(v['intestazione'], data_it)
 
-    # Ricostruisce la struttura della sorgente: ogni VociRecenti mantiene
-    # la propria sezione e il proprio insieme di voci.
-    source_blocks = source_instance_blocks(text, spans_v, expanded_by_index)
+    # Ricostruisce la struttura della sorgente: ogni VociRecenti e'
+    # accoppiata alla sezione archiviata corrispondente tramite un
+    # marcatore a hash calcolato sul testo grezzo che la precede.
+    source_instances = build_source_instances(text, spans_a, spans_v, expanded_by_index)
 
     def build_final_text():
         try:
@@ -712,9 +1002,9 @@ def process_page(page):
             archive_text, archive_page.title()
         )
 
-        merged_block, n_new = merge_structured_archive(
-            block, source_blocks
-        )
+        merged_block, n_new, ok = merge_marker_sections(block, source_instances)
+        if not ok:
+            return None, 0, False
 
         final_text = heading
         if heading:
@@ -724,13 +1014,26 @@ def process_page(page):
         final_text += BOT_START_MARKER + '\n\n'
         final_text += merged_block.strip('\n')
         final_text += '\n\n' + BOT_END_MARKER + after
-        return final_text, n_new
+        return final_text, n_new, True
 
-    final_text, n_new = build_final_text()
+    final_text, n_new, ok = build_final_text()
+
+    if not ok:
+        post_talk_notice_once(
+            archive_page, 'archivio-struttura-non-riconosciuta',
+            f"Errore: nella pagina di archivio {v['pagina']} non e' stato "
+            "trovato alcun marcatore di sezione riconoscibile dal bot e la "
+            "pagina non e' vuota; per sicurezza non e' stata modificata "
+            "automaticamente. Se l'archivio e' stato creato manualmente o "
+            "con una versione precedente del bot, e' necessario un "
+            "intervento manuale."
+        )
+        print("  Struttura archivio non riconoscibile, salvataggio annullato.")
+        return
 
     if len(final_text) > ARCHIVE_MAX_CHARS:
         post_talk_notice_once(
-            page, 'dimensione-eccessiva',
+            archive_page, 'dimensione-eccessiva',
             f"Errore: la pagina di archivio {v['pagina']} supererebbe la "
             f"dimensione massima consentita ({ARCHIVE_MAX_CHARS:,} caratteri) "
             f"e non e' stata aggiornata."
@@ -761,7 +1064,19 @@ def process_page(page):
                 print(f"  ERRORE: edit conflict persistente su {v['pagina']} dopo {SAVE_CONFLICT_RETRIES} tentativi, skip.")
                 return
             print(f"  Edit conflict su {v['pagina']}, ricarico e riapplico il merge (tentativo {attempts}/{SAVE_CONFLICT_RETRIES})...")
-            final_text, n_new = build_final_text()
+            final_text, n_new, ok = build_final_text()
+            if not ok:
+                post_talk_notice_once(
+                    archive_page, 'archivio-struttura-non-riconosciuta',
+                    f"Errore: nella pagina di archivio {v['pagina']} non e' "
+                    "stato trovato alcun marcatore di sezione riconoscibile "
+                    "dal bot e la pagina non e' vuota; per sicurezza non e' "
+                    "stata modificata automaticamente. Se l'archivio e' "
+                    "stato creato manualmente o con una versione precedente "
+                    "del bot, e' necessario un intervento manuale."
+                )
+                print("  Struttura archivio non riconoscibile dopo ricarico, salvataggio annullato.")
+                return
             if n_new == 0:
                 print("  Dopo il ricalcolo non ci sono piu' voci nuove (gia' archiviate da un altro run), skip.")
                 return
@@ -834,130 +1149,6 @@ def main():
     tee.close()
 
 
-
-def source_instance_blocks(text, spans_v, expanded_by_index):
-    """
-    Crea un blocco distinto per ogni istanza VociRecenti.
-
-    La stessa voce puo' quindi comparire in istanze diverse: la deduplica
-    viene applicata esclusivamente all'interno della singola istanza.
-    """
-    blocks = []
-    for idx, (s, e) in enumerate(spans_v):
-        heading_match = None
-        for m in re.finditer(r'(?m)^==[^=\n].*?==[ \t]*$', text[:s]):
-            heading_match = m
-
-        heading = heading_match.group(0).strip() if heading_match else ''
-        blocks.append({
-            'index': idx,
-            'heading': heading,
-            'lines': dedup_instance_lines(expanded_by_index[idx]),
-        })
-    return blocks
-
-
-def section_key(heading):
-    """Chiave stabile per associare una sezione dell'archivio alla sorgente."""
-    return re.sub(r'\s+', ' ', heading.strip()).casefold()
-
-
-def split_archive_sections(block_text):
-    """
-    Divide il blocco bot dell'archivio in sezioni di livello 2.
-    Se il vecchio archivio e' piatto e non contiene sezioni, il contenuto
-    viene conservato come preambolo per non perderlo.
-    """
-    matches = list(re.finditer(r'(?m)^==[^=\n].*?==[ \t]*$', block_text))
-    if not matches:
-        return block_text, []
-
-    preamble = block_text[:matches[0].start()]
-    sections = []
-    for i, m in enumerate(matches):
-        body_end = matches[i + 1].start() if i + 1 < len(matches) else len(block_text)
-        sections.append({
-            'heading': m.group(0).strip(),
-            'body': block_text[m.end():body_end],
-        })
-    return preamble, sections
-
-
-def merge_instance_section(existing_body, new_lines):
-    """
-    Fonde una singola istanza/sezione.
-
-    La deduplica non attraversa mai sezioni diverse.
-    """
-    existing_lines = extract_voci(existing_body)
-    existing_keys = {voce_key(line) for line in existing_lines}
-
-    merged = list(existing_lines)
-    n_new = 0
-    for line in dedup_instance_lines(new_lines):
-        key = voce_key(line)
-        if key in existing_keys:
-            continue
-        merged.append(line)
-        existing_keys.add(key)
-        n_new += 1
-    return merged, n_new
-
-
-def merge_structured_archive(existing_block_text, source_blocks):
-    """
-    Fonde le nuove voci nelle sezioni corrispondenti.
-
-    Ogni istanza VociRecenti della sorgente ha il proprio blocco e la
-    propria deduplica. Due istanze diverse possono contenere la stessa voce.
-    """
-    preamble, existing_sections = split_archive_sections(existing_block_text)
-
-    existing_by_key = {}
-    for i, sec in enumerate(existing_sections):
-        existing_by_key.setdefault(section_key(sec['heading']), []).append(i)
-
-    output_sections = []
-    used_existing = set()
-    total_new = 0
-
-    # La sorgente stabilisce ordine e struttura delle sezioni.
-    for src_block in source_blocks:
-        heading = src_block['heading']
-        key = section_key(heading)
-
-        existing_body = ''
-        if heading:
-            candidates = existing_by_key.get(key, [])
-            candidate = next((i for i in candidates if i not in used_existing), None)
-            if candidate is not None:
-                used_existing.add(candidate)
-                existing_body = existing_sections[candidate]['body']
-
-        merged_lines, n_new = merge_instance_section(
-            existing_body, src_block['lines']
-        )
-        total_new += n_new
-
-        if heading:
-            body = '\n' + '\n'.join(merged_lines) + '\n' if merged_lines else '\n'
-            output_sections.append(f"{heading}\n{body}")
-        elif merged_lines:
-            output_sections.append('\n'.join(merged_lines) + '\n')
-
-    # Non perdere sezioni eventualmente presenti nell'archivio ma assenti
-    # dalla pagina sorgente corrente.
-    for i, sec in enumerate(existing_sections):
-        if i not in used_existing:
-            output_sections.append(f"{sec['heading']}{sec['body']}")
-
-    prefix = preamble if preamble.strip() else ''
-    return prefix + ''.join(output_sections), total_new
-
-
-# ========================================
-# RETE / ORCHESTRAZIONE
-# ========================================
 
 if __name__ == "__main__":
     main()
