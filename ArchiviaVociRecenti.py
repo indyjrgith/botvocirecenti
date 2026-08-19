@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bot ArchiviaVociRecenti v1.2.2
+Bot ArchiviaVociRecenti v1.2.3
 
 Scansiona tutte le transclusioni di Template:ArchiviaVociRecenti, e per
 ogni pagina sorgente che lo include: se e' ora di archiviare, "subst-a"
@@ -75,6 +75,17 @@ Changelog:
         caratteri quando trovate, di 1 sulle graffe singole isolate); il
         rilevamento di squilibri genuini (es. un template annidato aperto
         e mai chiuso) resta invariato.
+- v1.2.3: Fix di append_new_entries: quando la sezione a cui si accodano
+        nuove voci e' l'ultima del blocco bot (adiacente a
+        BOT_END_MARKER), il suo 'body' include il '\n\n' che precede il
+        marcatore di fine, inserito da build_final_text. Cio' faceva si'
+        che il body terminasse gia' con newline multipli, non
+        normalizzati a uno solo prima di accodare le nuove voci, con
+        conseguente riga vuota spuria fra l'ultima voce preesistente e la
+        prima voce nuova (che rompeva la numerazione automatica delle
+        liste wikitext). La funzione ora normalizza sempre il body a
+        terminare con un singolo '\n' prima di accodare, indipendentemente
+        da quanti newline finali fossero presenti.
 """
 
 import pywikibot
@@ -160,7 +171,7 @@ ARCHIVE_MAX_CHARS = 1_500_000
 
 SAVE_CONFLICT_RETRIES = 2
 
-VERSION = '1.2.2'
+VERSION = '1.2.3'
 
 config.put_throttle = 1
 config.minthrottle = 0
@@ -642,8 +653,8 @@ def append_new_entries(existing_body, new_lines):
         return existing_body, 0
 
     body = existing_body
-    if body and not body.endswith('\n'):
-        body += '\n'
+    if body:
+        body = body.rstrip('\n') + '\n'
     body += '\n'.join(to_append) + '\n'
     return body, len(to_append)
 
