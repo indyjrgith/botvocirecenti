@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bot ArchiviaVociRecenti v1.2.3
+Bot ArchiviaVociRecenti v1.3.0
 
 Scansiona tutte le transclusioni di Template:ArchiviaVociRecenti, e per
 ogni pagina sorgente che lo include: se e' ora di archiviare, "subst-a"
@@ -86,9 +86,29 @@ Changelog:
         liste wikitext). La funzione ora normalizza sempre il body a
         terminare con un singolo '\n' prima di accodare, indipendentemente
         da quanti newline finali fossero presenti.
+- v1.3.0: Nuovo parametro 'pulizia' (off/on/si/lasciaredirect, default off).
+        Quando l'archiviazione viene eseguita (should_archive == True),
+        se pulizia != off il bot interroga in batch (query_titles_status,
+        chunk da CLEANUP_API_CHUNK_SIZE titoli per chiamata) lo stato
+        delle pagine di TUTTE le voci presenti nel blocco bot dell'
+        archivio (non solo quelle appena aggiunte in questo passaggio) e
+        rimuove le righe relative a pagine cancellate (sempre, in
+        modalita' 'on'/'si' e 'lasciaredirect') o diventate redirect
+        (solo in modalita' 'on'/'si'; in 'lasciaredirect' i redirect
+        restano per verifiche manuali). La pulizia e' applicata da
+        apply_pulizia() sul blocco gia' fuso da merge_marker_sections,
+        dopo il merge e prima della ricostruzione del testo finale;
+        righe-voce senza un wikilink riconoscibile non vengono toccate.
+        Poiche' la pulizia puo' rimuovere voci anche quando non ce ne
+        sono di nuove da aggiungere, build_final_text ora restituisce
+        anche n_removed e il salvataggio viene eseguito se n_new > 0
+        OPPURE n_removed > 0 (prima veniva saltato se n_new == 0). In
+        caso di errore della query API su un batch di titoli, quei
+        titoli non vengono toccati (nessuna rimozione), per sicurezza.
 """
 
 import pywikibot
+import pywikibot.data.api
 import pywikibot.config as config
 from datetime import datetime, timedelta
 import re
@@ -171,7 +191,13 @@ ARCHIVE_MAX_CHARS = 1_500_000
 
 SAVE_CONFLICT_RETRIES = 2
 
-VERSION = '1.2.3'
+# Numero di titoli per chiamata API nella verifica batch dello stato delle
+# pagine (parametro pulizia=). Il bot e' flaggato (apihighlimits, 500 per
+# chiamata) ma per prudenza si usa lo stesso valore gia' adottato per
+# l'altro bot del progetto.
+CLEANUP_API_CHUNK_SIZE = 50
+
+VERSION = '1.3.0'
 
 config.put_throttle = 1
 config.minthrottle = 0
@@ -434,9 +460,19 @@ def validate_archivia_params(params):
     forza_raw = (params.get('forza') or '').strip().lower()
     forza = forza_raw == 'si'
 
+    pulizia_raw = (params.get('pulizia') or '').strip().lower()
+    if pulizia_raw in ('', 'off', 'no'):
+        pulizia = 'off'
+    elif pulizia_raw in ('on', 'si'):
+        pulizia = 'on'
+    elif pulizia_raw == 'lasciaredirect':
+        pulizia = 'lasciaredirect'
+    else:
+        pulizia = None  # non valido, gestito sotto dopo il check su 'pagina'
+
     result = {
         'ok': False, 'pagina': None, 'giorni': DEFAULT_GIORNI,
-        'intestazione': None, 'forza': forza, 'errore': None,
+        'intestazione': None, 'forza': forza, 'pulizia': 'off', 'errore': None,
     }
 
     if not pagina:
@@ -468,10 +504,20 @@ def validate_archivia_params(params):
             )
             return result
 
+    if pulizia is None:
+        result['pagina'] = pagina  # titolo comunque valido/risolvibile
+        result['giorni'] = giorni
+        result['errore'] = (
+            'Errore: il parametro pulizia deve essere "off", "on" (o "si") '
+            f'oppure "lasciaredirect" (valore fornito: "{pulizia_raw}")'
+        )
+        return result
+
     result['ok'] = True
     result['pagina'] = pagina
     result['giorni'] = giorni
     result['intestazione'] = intestazione
+    result['pulizia'] = pulizia
     result['errore'] = None
     return result
 
@@ -513,6 +559,129 @@ def dedup_instance_lines(lines):
         seen.add(key)
         result.append(line)
     return result
+
+
+# ========================================
+# PULIZIA ARCHIVIO (parametro pulizia=on/si/lasciaredirect)
+# ========================================
+
+def extract_voce_title(line):
+    """Estrae il titolo della voce (primo wikilink della riga),
+    normalizzato come voce_key. None se la riga non ha un wikilink
+    riconoscibile."""
+    m = WIKILINK_RE.search(line)
+    if not m:
+        return None
+    return m.group(1).replace('_', ' ').strip()
+
+
+def query_titles_status(titles):
+    """
+    Interroga in batch (chunk da CLEANUP_API_CHUNK_SIZE titoli per
+    chiamata, action=query&prop=info) lo stato delle pagine indicate.
+    Restituisce un dict {titolo: {'missing': bool, 'redirect': bool,
+    'error': bool}}. In caso di errore su un batch, i titoli di quel
+    batch vengono marcati 'error': True (nessuna rimozione verra'
+    applicata a quei titoli, per sicurezza).
+    """
+    status = {}
+    unique_titles = list(dict.fromkeys(titles))  # dedup preservando l'ordine
+
+    for i in range(0, len(unique_titles), CLEANUP_API_CHUNK_SIZE):
+        chunk = unique_titles[i:i + CLEANUP_API_CHUNK_SIZE]
+        try:
+            req = pywikibot.data.api.Request(
+                site=SITE,
+                parameters={
+                    'action': 'query',
+                    'prop': 'info',
+                    'titles': '|'.join(chunk),
+                }
+            )
+            data = req.submit()
+        except Exception as e:
+            print(f"WARNING: query stato pagine (pulizia) fallita per un batch di {len(chunk)} titoli: {e}")
+            for t in chunk:
+                status[t] = {'missing': False, 'redirect': False, 'error': True}
+            continue
+
+        query = data.get('query', {})
+        pages = query.get('pages', {})
+        for pinfo in pages.values():
+            title = pinfo.get('title')
+            if title is None:
+                continue
+            status[title] = {
+                'missing': 'missing' in pinfo,
+                'redirect': 'redirect' in pinfo,
+                'error': False,
+            }
+
+        # I titoli normalizzati da MediaWiki (es. differenze di
+        # maiuscola/minuscola nella prima lettera) vanno rimappati sul
+        # titolo originale richiesto, se non gia' presente.
+        for norm in query.get('normalized', []):
+            orig, to = norm.get('from'), norm.get('to')
+            if orig and to in status and orig not in status:
+                status[orig] = status[to]
+
+    return status
+
+
+def apply_pulizia(merged_block, modalita):
+    """
+    Applica la pulizia al blocco bot GIA' FUSO (tutte le sezioni
+    dell'archivio, non solo quelle toccate in questo passaggio):
+    rimuove le righe-voce relative a pagine cancellate (sempre, se
+    modalita' != 'off') e, solo in modalita' 'on', anche quelle
+    relative a pagine diventate redirect. Righe senza un wikilink
+    riconoscibile non vengono toccate. In caso di errore della query
+    API su un titolo, quel titolo non viene toccato.
+    Restituisce (nuovo_blocco, n_rimosse).
+    """
+    if modalita == 'off':
+        return merged_block, 0
+
+    line_matches = list(VOCE_LINE_RE.finditer(merged_block))
+    if not line_matches:
+        return merged_block, 0
+
+    titles_by_match = []
+    titles_to_query = []
+    for m in line_matches:
+        title = extract_voce_title(m.group(0))
+        titles_by_match.append(title)
+        if title is not None:
+            titles_to_query.append(title)
+
+    if not titles_to_query:
+        return merged_block, 0
+
+    status = query_titles_status(titles_to_query)
+
+    spans_to_remove = []
+    for m, title in zip(line_matches, titles_by_match):
+        if title is None:
+            continue
+        st = status.get(title)
+        if st is None or st['error']:
+            continue
+        remove = st['missing'] or (st['redirect'] and modalita == 'on')
+        if not remove:
+            continue
+        start, end = m.span()
+        if end < len(merged_block) and merged_block[end] == '\n':
+            end += 1
+        spans_to_remove.append((start, end))
+
+    if not spans_to_remove:
+        return merged_block, 0
+
+    new_block = merged_block
+    for start, end in sorted(spans_to_remove, reverse=True):
+        new_block = new_block[:start] + new_block[end:]
+
+    return new_block, len(spans_to_remove)
 
 
 # ========================================
@@ -991,7 +1160,7 @@ def process_page(page):
             "comunque state archiviate."
         )
 
-    if not any(expanded_by_index.values()):
+    if not any(expanded_by_index.values()) and v['pulizia'] == 'off':
         print("  Nessuna voce estratta (tutte le istanze in errore o vuote), skip salvataggio.")
         return
 
@@ -1015,7 +1184,15 @@ def process_page(page):
 
         merged_block, n_new, ok = merge_marker_sections(block, source_instances)
         if not ok:
-            return None, 0, False
+            return None, 0, 0, False
+
+        # Pulizia sull'intero blocco bot gia' fuso (tutte le sezioni
+        # dell'archivio, non solo quelle appena toccate in questo
+        # passaggio), eseguita solo nei passaggi in cui si archivia
+        # effettivamente (siamo gia' oltre il check should_archive).
+        n_removed = 0
+        if v['pulizia'] != 'off':
+            merged_block, n_removed = apply_pulizia(merged_block, v['pulizia'])
 
         final_text = heading
         if heading:
@@ -1025,9 +1202,9 @@ def process_page(page):
         final_text += BOT_START_MARKER + '\n\n'
         final_text += merged_block.strip('\n')
         final_text += '\n\n' + BOT_END_MARKER + after
-        return final_text, n_new, True
+        return final_text, n_new, n_removed, True
 
-    final_text, n_new, ok = build_final_text()
+    final_text, n_new, n_removed, ok = build_final_text()
 
     if not ok:
         post_talk_notice_once(
@@ -1052,14 +1229,19 @@ def process_page(page):
         print("  Dimensione massima superata, salvataggio annullato.")
         return
 
-    if n_new == 0:
-        print("  Nessuna voce nuova da archiviare (tutte gia' presenti), skip salvataggio.")
+    if n_new == 0 and n_removed == 0:
+        print("  Nessuna voce nuova da archiviare e nessuna voce da rimuovere, skip salvataggio.")
         return
 
-    summary = f'Bot: Archiviazione voci recenti (v.{VERSION})'
+    summary_parts = []
+    if n_new:
+        summary_parts.append(f'{n_new} nuove voci archiviate')
+    if n_removed:
+        summary_parts.append(f'{n_removed} voci rimosse (pulizia)')
+    summary = f"Bot: {'; '.join(summary_parts)} (v.{VERSION})"
 
     if DRY_RUN:
-        print(f"[DRY-RUN] Salverei {n_new} nuove voci su {v['pagina']} ({len(final_text)} caratteri).")
+        print(f"[DRY-RUN] Salverei: {n_new} nuove voci, {n_removed} voci rimosse su {v['pagina']} ({len(final_text)} caratteri).")
         return
 
     attempts = 0
@@ -1067,7 +1249,7 @@ def process_page(page):
         try:
             archive_page.text = final_text
             archive_page.save(summary=summary, minor=True, bot=True)
-            print(f"  OK - {n_new} nuove voci archiviate su {v['pagina']}.")
+            print(f"  OK - {n_new} nuove voci archiviate, {n_removed} voci rimosse su {v['pagina']}.")
             return
         except pywikibot.exceptions.EditConflictError:
             attempts += 1
@@ -1075,7 +1257,7 @@ def process_page(page):
                 print(f"  ERRORE: edit conflict persistente su {v['pagina']} dopo {SAVE_CONFLICT_RETRIES} tentativi, skip.")
                 return
             print(f"  Edit conflict su {v['pagina']}, ricarico e riapplico il merge (tentativo {attempts}/{SAVE_CONFLICT_RETRIES})...")
-            final_text, n_new, ok = build_final_text()
+            final_text, n_new, n_removed, ok = build_final_text()
             if not ok:
                 post_talk_notice_once(
                     archive_page, 'archivio-struttura-non-riconosciuta',
@@ -1088,8 +1270,8 @@ def process_page(page):
                 )
                 print("  Struttura archivio non riconoscibile dopo ricarico, salvataggio annullato.")
                 return
-            if n_new == 0:
-                print("  Dopo il ricalcolo non ci sono piu' voci nuove (gia' archiviate da un altro run), skip.")
+            if n_new == 0 and n_removed == 0:
+                print("  Dopo il ricalcolo non ci sono piu' voci nuove ne' da rimuovere, skip.")
                 return
         except Exception as e:
             print(f"  ERRORE salvataggio su {v['pagina']}: {e}")

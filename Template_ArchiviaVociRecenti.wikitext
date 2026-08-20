@@ -1,0 +1,48 @@
+<includeonly>{{#if:{{{pagina|}}}
+ |{{#switch:{{NAMESPACE:{{{pagina}}}}}
+ |Utente
+ |Discussioni utente
+ |Wikipedia
+ |Discussioni Wikipedia
+ |Progetto
+ |Discussioni progetto
+ |Portale
+ |Discussioni portale
+ ={{#if:{{#iferror:
+   {{#ifexpr:{{{giorni|10}}} != {{{giorni|10}}} round 0 or {{{giorni|10}}} < 1 or {{{giorni|10}}} > 10
+    |1
+   }}
+  |1
+ }}
+ |<strong class="error">Errore: {{tl|ArchiviaVociRecenti}} — il parametro <code>giorni</code> deve essere un numero intero compreso tra 1 e 10 (valore fornito: <nowiki>{{{giorni}}}</nowiki>).</strong>
+ |{{#switch:{{lc:{{{pulizia|off}}}}}
+  |off|no||on|si|lasciaredirect=
+  |#default=<strong class="error">Errore: {{tl|ArchiviaVociRecenti}} — il parametro <code>pulizia</code> deve essere "off", "on" (o "si") oppure "lasciaredirect" (valore fornito: <nowiki>{{{pulizia}}}</nowiki>).</strong>
+ }}
+}}
+ |#default=<strong class="error">Errore: {{tl|ArchiviaVociRecenti}} — il namespace della pagina indicata in <code>pagina</code> non è tra quelli ammessi (Utente, Wikipedia, Progetto, Portale e le rispettive pagine di discussione). Valore fornito: <nowiki>{{{pagina}}}</nowiki>.</strong>
+ }}
+ |<strong class="error">Errore: {{tl|ArchiviaVociRecenti}} — il parametro <code>pagina</code> è obbligatorio e non può essere vuoto.</strong>
+}}</includeonly><noinclude>
+== Uso ==
+<pre>
+{{ArchiviaVociRecenti
+|pagina=Progetto:NomeProgetto/Archivio voci recenti
+|giorni=10
+|intestazione=== Archiviazione eseguita il %d ==
+|forza=no
+|pulizia=off
+}}
+</pre>
+
+=== Parametri ===
+* '''pagina''' (obbligatorio) — pagina di archivio su cui il bot appende le voci. Deve appartenere a uno dei namespace ammessi: Utente, Wikipedia, Progetto, Portale (o le rispettive pagine di discussione).
+* '''giorni''' (opzionale, default 10) — numero intero da 1 a 10: ogni quanti giorni di calendario il bot esegue l'archiviazione. Se omesso, viene utilizzato il valore 10.
+* '''intestazione''' (opzionale) — testo dell'intestazione di sezione inserita in archivio; <code>%d</code> viene sostituito con la data. Default: <code>== Archiviazione eseguita il %d ==</code>.
+* '''forza''' (opzionale, default no) — se valorizzato a <code>si</code> (case-insensitive), forza l'archiviazione anche se non sono trascorsi i giorni indicati.
+* '''pulizia''' (opzionale, default off) — se valorizzato a <code>on</code> (o <code>si</code>), rimuove dall'archivio le voci relative a pagine cancellate o diventate redirect; se valorizzato a <code>lasciaredirect</code>, rimuove solo le voci cancellate e lascia i redirect per verifica manuale.
+
+Questo template esegue solo i controlli realizzabili in puro wikitext (parametro <code>pagina</code> mancante, namespace non ammesso, <code>giorni</code> fuori range 1-10 o non intero). Altri controlli strutturali (istanze multiple del template nella pagina, assenza di {{tl|VociRecenti}}) sono eseguiti dal bot durante la scansione e segnalati separatamente (talk della pagina / log del bot).
+
+[[Categoria:Template di servizio]]
+</noinclude>
