@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bot ArchiviaVociRecenti v1.3.0
+Bot ArchiviaVociRecenti v1.3.1
 
 Scansiona tutte le transclusioni di Template:ArchiviaVociRecenti, e per
 ogni pagina sorgente che lo include: se e' ora di archiviare, "subst-a"
@@ -105,6 +105,17 @@ Changelog:
         OPPURE n_removed > 0 (prima veniva saltato se n_new == 0). In
         caso di errore della query API su un batch di titoli, quei
         titoli non vengono toccati (nessuna rimozione), per sicurezza.
+- v1.3.1: Fix: se la pagina sorgente non contiene piu' alcuna istanza di
+        VociRecenti (spans_v vuoto, es. template rimosso dopo che le voci
+        sono gia' state archiviate) e la pulizia e' attiva (pulizia !=
+        off), il bot non esce piu' immediatamente: prosegue fino a
+        should_archive/build_final_text, cosi' la pulizia dell'archivio
+        viene comunque valutata al passaggio previsto in base all'opzione
+        'giorni', anche in assenza di voci nuove da archiviare. In questo
+        caso non viene piu' postato l'avviso 'manca-vocirecenti' in talk,
+        trattandosi di uno stato normale di funzionamento (non un errore)
+        quando la pulizia e' attiva. Comportamento invariato quando
+        pulizia == off: il bot esce subito con l'avviso, come prima.
 """
 
 import pywikibot
@@ -197,7 +208,7 @@ SAVE_CONFLICT_RETRIES = 2
 # l'altro bot del progetto.
 CLEANUP_API_CHUNK_SIZE = 50
 
-VERSION = '1.3.0'
+VERSION = '1.3.1'
 
 config.put_throttle = 1
 config.minthrottle = 0
@@ -1121,13 +1132,22 @@ def process_page(page):
             "elaborate normalmente."
         )
 
-    if not spans_v:
+    if not spans_v and v['pulizia'] == 'off':
         post_talk_notice_once(
             notice_page, 'manca-vocirecenti',
             "Errore: Template VociRecenti non presente nella pagina."
         )
         print("  Nessuna istanza di VociRecenti trovata, skip archiviazione.")
         return
+
+    if not spans_v:
+        # Nessuna istanza di VociRecenti nella sorgente, ma la pulizia e'
+        # attiva: e' uno stato normale di funzionamento (es. template
+        # rimosso dopo che le voci sono gia' state archiviate), non un
+        # errore da segnalare in talk. Si prosegue comunque fino a
+        # should_archive/build_final_text, cosi' la pulizia dell'archivio
+        # viene comunque valutata al passaggio previsto in base a 'giorni'.
+        print("  Nessuna istanza di VociRecenti trovata; pulizia attiva, valuto solo l'eventuale pulizia.")
 
     archive_page = notice_page
 
