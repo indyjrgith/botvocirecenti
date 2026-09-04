@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.8.0
+Bot VociRecenti v9.8.1
 
 Changelog:
 - v9.8.0: OTTIMIZZAZIONE PRESTAZIONI: tre interventi per ridurre il tempo
@@ -327,7 +327,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.8.0'
+VERSION = '9.8.1'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -2919,7 +2919,24 @@ def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
                         'ns0_to_ns0_api_error',
                         'ns0_to_ns0_old',
                     }
-                    if cached.get('reason') not in _stale_reasons:
+                    _reason = cached.get('reason')
+                    _skip_cached = _reason not in _stale_reasons
+                    if _skip_cached:
+                        # FIX v9.8.1 (bug 'Terremoto di Choco del 2026'): le reason
+                        # 'banali' (not_exist/redirect/ns<N>) derivano da un rifiuto
+                        # legato a un vecchio spostamento (es. NS0->Bozza senza
+                        # redirect, quindi pagina 'missing' per il bot). Se nel
+                        # frattempo e' arrivato un NUOVO spostamento verso NS0 con
+                        # timestamp piu' recente di quel rifiuto (move_ts_str e'
+                        # gia' disponibile qui, nessuna chiamata API aggiuntiva),
+                        # il rifiuto e' obsoleto e va rivalutato invece di bloccare
+                        # per sempre il titolo fino a scadenza naturale (30gg).
+                        _banal_reasons = {'not_exist', 'redirect'}
+                        _is_banal = bool(_reason) and (
+                            _reason in _banal_reasons or re.match(r'^ns\d+$', _reason))
+                        if _is_banal and move_ts_str > cached.get('processed_at', '0'):
+                            _skip_cached = False
+                    if _skip_cached:
                         skipped_cached += 1
                         continue
                 # FIX v9.6.7: source_ns e target_ns letti da log.data/params senza
