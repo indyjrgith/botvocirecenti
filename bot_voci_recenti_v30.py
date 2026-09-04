@@ -1,8 +1,38 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.9.0
+Bot VociRecenti v9.9.1
 
 Changelog:
+- v9.9.1: OTTIMIZZAZIONE PRESTAZIONI: STEP 2 (pulizia cache) passava da 7-8 a
+        25 minuti man mano che la cache cresceva (3838 voci), perche' la
+        FASE 3 (_cleanup_check_and_update_pages_batch) recupera le categorie
+        di TUTTE le voci sopravvissute ad ogni run: a differenza delle
+        chiamate revisions (v9.7.1: filtrate da touched_cache; v9.8.0:
+        parallelizzate con ThreadPoolExecutor), il fetch categorie non aveva
+        mai ricevuto lo stesso trattamento e restava lineare-e-sequenziale
+        (16m59s su 25m52s totali nel run di riferimento).
+        Fix 1 (touched_cache): _cleanup_check_and_update_pages_batch ora
+        recupera le categorie SOLO per le voci in titles_need_rev (touched
+        cambiato o non ancora in cache), esattamente come gia' avviene per
+        revisions. Le voci con touched invariato (titles_skip_rev) non
+        vengono piu' ricontrollate: si mantengono le categorie gia' presenti
+        nel record di cache. Rischio noto e accettato: nei rari casi in cui
+        una categoria cambia senza che 'touched' della voce venga aggiornato,
+        l'aggiornamento verra' rilevato solo al successivo run in cui
+        'touched' cambia.
+        Fix 2 (parallelizzazione): _cleanup_fetch_categories_for_titles e'
+        stata riscritta per eseguire i batch da CLEANUP_BATCH_SIZE titoli in
+        parallelo con concurrent.futures.ThreadPoolExecutor (REVISIONS_THREADS
+        worker), stesso pattern gia' usato per la CHIAMATA A di
+        _cleanup_fetch_wikitext_for_titles. Ogni worker (_cleanup_fetch_
+        categories_batch_worker) gestisce la propria paginazione clcontinue e
+        scrive solo nel proprio dizionario locale, unito nel thread
+        principale al termine (nessuna scrittura condivisa concorrente).
+        Essendo la funzione generica, il beneficio si estende anche
+        all'altro punto di chiamata (download_page_data_batch, via
+        _download_fetch_categories_for_titles).
+        Nessuna modifica alla struttura di moves_cache.json ne' al formato
+        dei record in cache.
 - v9.9.0: FIX bug reale "Parco nazionale di Kahurangi" (mai risolto nonostante
         i quattro fix v9.6.4-v9.6.7, che inseguivano sintomi collaterali senza
         toccare la causa di fondo). La risalita della catena di spostamenti
@@ -387,7 +417,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.9.0'
+VERSION = '9.9.1'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -1302,11 +1332,77 @@ def split_pages_into_files(pages_data):
 # PULIZIA CACHE INTERNA (ex PuliziaCache.py)
 # ========================================
 
+def _cleanup_fetch_categories_batch_worker(batch, batch_index):
+    """
+    Worker: scarica le categorie per UN batch da CLEANUP_BATCH_SIZE titoli,
+    gestendo internamente la paginazione (clcontinue). Eseguito in parallelo
+    da _cleanup_fetch_categories_for_titles tramite ThreadPoolExecutor
+    (v9.9.1): ogni worker scrive solo nel proprio dizionario locale, che
+    viene unito nel thread principale (nessun dato condiviso in scrittura
+    concorrente).
+    Restituisce dict {titolo: {'visible': [...], 'hidden': [...]}} limitato
+    ai titoli del batch.
+    """
+    local_cats = {t: {'visible': [], 'hidden': []} for t in batch}
+    norm_to_orig = {}
+    params = {
+        'action': 'query',
+        'prop': 'categories',
+        'titles': '|'.join(batch),
+        'cllimit': '500',
+        'clprop': 'hidden',
+        'format': 'json',
+    }
+    while True:
+        try:
+            result = SITE.simple_request(**params).submit()
+        except Exception as e:
+            _clog_only(f"  WARNING _fetch_categories batch [{batch_index + 1}]: {e}")
+            break
+        query_data = result.get('query', {})
+        if not norm_to_orig:
+            for n in query_data.get('normalized', []):
+                norm_to_orig[n['to']] = n['from']
+        for page_id, page_info in query_data.get('pages', {}).items():
+            if page_id == '-1' or 'missing' in page_info:
+                continue
+            title_norm = page_info.get('title', '')
+            orig = norm_to_orig.get(title_norm, title_norm)
+            key = orig if orig in local_cats else title_norm
+            if key not in local_cats:
+                continue
+            for cat in page_info.get('categories', []):
+                cat_title = cat.get('title', '')
+                if ':' in cat_title:
+                    cat_title = cat_title.split(':', 1)[1]
+                if not cat_title:
+                    continue
+                is_hidden = 'hidden' in cat
+                bucket = 'hidden' if is_hidden else 'visible'
+                if cat_title not in local_cats[key][bucket]:
+                    local_cats[key][bucket].append(cat_title)
+        cont = result.get('query-continue', {}).get('categories', {})
+        if not cont:
+            cont = result.get('continue', {})
+            clcontinue = cont.get('clcontinue', '')
+        else:
+            clcontinue = cont.get('clcontinue', '')
+        if clcontinue:
+            params['clcontinue'] = clcontinue
+        else:
+            break
+
+    return local_cats
+
+
 def _cleanup_fetch_categories_for_titles(titles):
     """
     Scarica le categorie complete per una lista di titoli tramite API batch.
-    Itera su batch da CLEANUP_BATCH_SIZE titoli. Per ogni batch gestisce la
-    paginazione con clcontinue.
+    Suddivide in batch da CLEANUP_BATCH_SIZE titoli ed esegue i batch in
+    parallelo con ThreadPoolExecutor (REVISIONS_THREADS worker, v9.9.1):
+    le chiamate sono read-only, stesso pattern gia' usato per la CHIAMATA A
+    di _cleanup_fetch_wikitext_for_titles. Ogni batch gestisce internamente
+    la propria paginazione (clcontinue).
     Usa clprop=hidden per distinguere categorie visibili e nascoste (zero
     chiamate API aggiuntive: hidden e' un campo extra nella risposta esistente).
     Restituisce dict {titolo: {'visible': [...], 'hidden': [...]}}.
@@ -1314,56 +1410,18 @@ def _cleanup_fetch_categories_for_titles(titles):
     verrebbero silenziosamente scartate.
     """
     cats_by_title = {t: {'visible': [], 'hidden': []} for t in titles}
+    if not titles:
+        return cats_by_title
 
-    for batch_start in range(0, len(titles), CLEANUP_BATCH_SIZE):
-        batch = titles[batch_start:batch_start + CLEANUP_BATCH_SIZE]
-        norm_to_orig = {}
-        params = {
-            'action': 'query',
-            'prop': 'categories',
-            'titles': '|'.join(batch),
-            'cllimit': '500',
-            'clprop': 'hidden',
-            'format': 'json',
-        }
-        while True:
-            try:
-                result = SITE.simple_request(**params).submit()
-            except Exception as e:
-                _clog_only(f"  WARNING _fetch_categories batch [{batch_start//CLEANUP_BATCH_SIZE + 1}]: {e}")
-                break
-            query_data = result.get('query', {})
-            if not norm_to_orig:
-                for n in query_data.get('normalized', []):
-                    norm_to_orig[n['to']] = n['from']
-            for page_id, page_info in query_data.get('pages', {}).items():
-                if page_id == '-1' or 'missing' in page_info:
-                    continue
-                title_norm = page_info.get('title', '')
-                orig = norm_to_orig.get(title_norm, title_norm)
-                key = orig if orig in cats_by_title else title_norm
-                if key not in cats_by_title:
-                    continue
-                for cat in page_info.get('categories', []):
-                    cat_title = cat.get('title', '')
-                    if ':' in cat_title:
-                        cat_title = cat_title.split(':', 1)[1]
-                    if not cat_title:
-                        continue
-                    is_hidden = 'hidden' in cat
-                    bucket = 'hidden' if is_hidden else 'visible'
-                    if cat_title not in cats_by_title[key][bucket]:
-                        cats_by_title[key][bucket].append(cat_title)
-            cont = result.get('query-continue', {}).get('categories', {})
-            if not cont:
-                cont = result.get('continue', {})
-                clcontinue = cont.get('clcontinue', '')
-            else:
-                clcontinue = cont.get('clcontinue', '')
-            if clcontinue:
-                params['clcontinue'] = clcontinue
-            else:
-                break
+    batches = [titles[i:i + CLEANUP_BATCH_SIZE]
+               for i in range(0, len(titles), CLEANUP_BATCH_SIZE)]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=REVISIONS_THREADS) as executor:
+        futures = [executor.submit(_cleanup_fetch_categories_batch_worker, batch, idx)
+                   for idx, batch in enumerate(batches)]
+        for future in futures:
+            local_cats = future.result()
+            cats_by_title.update(local_cats)
 
     return cats_by_title
 
@@ -1480,7 +1538,11 @@ def _cleanup_check_and_update_pages_batch(pages, moves_cache=None):
     Tre passate:
       1. prop=info (CLEANUP_BATCH_SIZE): rilevamento missing/redirect/NS errato
          + raccolta campo 'touched' per touched_cache (v9.7.0)
-      2. prop=categories (CLEANUP_BATCH_SIZE, con paginazione)
+      2. prop=categories (CLEANUP_BATCH_SIZE, con paginazione, batch paralleli
+         con ThreadPoolExecutor). Dal v9.9.1 eseguita SOLO per le voci con
+         'touched' cambiato rispetto all'ultimo run (stesso filtro
+         touched_cache della passata 3): le voci invariate mantengono le
+         categorie gia' in cache, senza fetch.
       3. prop=revisions (CLEANUP_BATCH_SIZE_REV): wikitext + timestamp creazione
          Solo per voci con 'touched' cambiato rispetto all'ultimo run (touched_cache).
          Al primo run dopo il deploy tutte le voci mancano dalla touched_cache
@@ -1565,8 +1627,9 @@ def _cleanup_check_and_update_pages_batch(pages, moves_cache=None):
         titles_need_rev = survivor_titles
         titles_skip_rev = []
 
-    print(f"  Recupero categorie per {len(survivor_titles)} voci...")
-    cats_by_title = _cleanup_fetch_categories_for_titles(survivor_titles)
+    print(f"  Recupero categorie per {len(titles_need_rev)} voci "
+          f"({len(titles_skip_rev)} saltate: touched invariato, v9.9.1)...")
+    cats_by_title = _cleanup_fetch_categories_for_titles(titles_need_rev)
 
     print(f"  Recupero wikitext e timestamp creazione per {len(titles_need_rev)} voci "
           f"({CLEANUP_BATCH_SIZE_REV} titoli/chiamata)...")
@@ -1583,6 +1646,11 @@ def _cleanup_check_and_update_pages_batch(pages, moves_cache=None):
         if record is None:
             continue
 
+        if orig_title in titles_skip_rev:
+            # Voce non modificata (touched invariato, v9.9.1): nessun fetch
+            # categorie eseguito, si mantiene il record cosi' com'e' in cache.
+            continue
+
         if orig_title in cats_by_title:
             cat_data = cats_by_title[orig_title]
         else:
@@ -1591,22 +1659,6 @@ def _cleanup_check_and_update_pages_batch(pages, moves_cache=None):
 
         new_cats        = cat_data.get('visible', [])
         new_cats_hidden = cat_data.get('hidden', [])
-
-        if orig_title in titles_skip_rev:
-            # Voce non modificata: aggiorna solo categorie se cambiate,
-            # mantieni wikitext/templates/preview/creation_ts dalla cache.
-            old_cats        = record.get('categorie', [])
-            old_cats_hidden = record.get('categorie_nascoste', [])
-            cats_changed = (set(new_cats) != set(old_cats)
-                            or (not old_cats and bool(new_cats))
-                            or set(new_cats_hidden) != set(old_cats_hidden))
-            if cats_changed:
-                updated = dict(record)
-                updated['categorie']          = new_cats
-                updated['categorie_nascoste'] = new_cats_hidden
-                updated_records[orig_title] = updated
-                _clog_only(f"  AGGIORNATA (categorie): {orig_title}")
-            continue
 
         # Voce modificata o non ancora in touched_cache: percorso completo
         rev_data = rev_by_title.get(orig_title, {})
