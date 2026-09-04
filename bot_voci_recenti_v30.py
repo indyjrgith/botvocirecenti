@@ -1,8 +1,68 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.8.1
+Bot VociRecenti v9.9.0
 
 Changelog:
+- v9.9.0: FIX bug reale "Parco nazionale di Kahurangi" (mai risolto nonostante
+        i quattro fix v9.6.4-v9.6.7, che inseguivano sintomi collaterali senza
+        toccare la causa di fondo). La risalita della catena di spostamenti
+        NS0->NS0 in _get_ns0_origin_timestamp non poteva funzionare per un
+        limite strutturale di MediaWiki stesso, non di pywikibot:
+        list=logevents con letitle=X (cioe' logevents(page=X)) trova SOLO gli
+        spostamenti fatti DA X, mai lo spostamento che ha CREATO X (quello e'
+        loggato sotto il titolo precedente, non piu' recuperabile per titolo).
+        Confermato sui ticket Phabricator T152829, T66184, T47949 (ancora
+        aperti, mai risolti da MediaWiki) e sul codice sorgente di
+        MoveLogFormatter. L'API logevents non espone nemmeno un filtro per
+        pageid, quindi non esiste un modo diretto via rete per aggirare il
+        limite.
+        Conseguenza pratica: la funzione cadeva SEMPRE nel fallback
+        'creation' (data di creazione reale della pagina), che per voci
+        create fuori NS0 (es. Bozza) e spostate di recente in NS0 restituiva
+        una data troppo vecchia, causando rifiuto errato con reason
+        'ns0_to_ns0_old' anche quando l'ingresso in NS0 era recente.
+        Fix: get_moved_to_ns0_since_cutoff ora lavora in due passate sullo
+        STESSO fetch di rete gia' esistente (site.logevents(logtype='move'),
+        nessuna chiamata API aggiuntiva):
+          Passata 1: costruisce in memoria una mappa
+          titolo_destinazione -> (titolo_sorgente, ns_sorgente, timestamp)
+          per ogni spostamento nella finestra di cutoff.
+          Passata 2: per ogni spostamento NS0->NS0, risale la catena IN
+          MEMORIA (limite MAX_NS0_CHAIN_DEPTH, con protezione cicli) fino a
+          trovare un ingresso NS!=0->NS0 nella finestra; solo se non lo trova
+          ricade nel fallback 'creation' esistente (invariato).
+        La chiamata site.logevents(page=title) per-voce (sempre infruttuosa,
+        quindi solo spreco di risorse) e' stata rimossa: _get_ns0_origin_timestamp
+        e' stata riscritta come funzione pura (nessuna chiamata API), che
+        opera sulla mappa gia' costruita in Passata 1.
+        Nessuna modifica alla struttura di moves_cache.json (stesse chiavi e
+        stessi possibili valori di reason: ns0_to_ns0_move / ns0_to_ns0_creation
+        / ns0_to_ns0_old / ns0_to_ns0_api_error / ns0_to_ns0_ts_parse_error).
+        Aggiunto log di riepilogo con conteggio separato delle accettazioni
+        via catena-in-memoria vs fallback creation, per monitorare eventuali
+        anomalie al primo run.
+        Nota su rischio regressione (voci vecchissime con solo spostamento
+        recente, gia' visto in passato nel progetto): strutturalmente escluso,
+        perche' il controllo origin_dt < cutoff_date resta invariato e la
+        catena in memoria non puo' mai produrre un'origine precedente al
+        cutoff (i dati usati provengono dallo stesso scan che si ferma al
+        cutoff). Per il caso comune (rinomina pura di una voce vecchia, senza
+        vero ingresso NS0 recente), il comportamento e' identico a prima:
+        nessuna origine trovata in catena -> fallback 'creation' -> rifiuto
+        se vecchia, come sempre.
+- v9.8.2: OSSERVABILITA' (mai pushata su GitHub, presente solo in locale):
+        aggiunto il contatore reactivated_stale_reject e la relativa riga nel
+        messaggio di riepilogo di get_moved_to_ns0_since_cutoff, per rendere
+        visibile a runtime quante voci con rifiuto "banale" in cache
+        (not_exist/redirect/ns<N>) sono state riattivate dal fix v9.8.1.
+        Nessuna modifica di logica: solo logging.
+- v9.8.1: FIX bug "Terremoto di Chocò del 2026". Le reason "banali"
+        (not_exist/redirect/ns<N>) derivano da un rifiuto legato a un vecchio
+        spostamento (es. NS0->Bozza senza redirect, quindi pagina "missing"
+        per il bot). Se nel frattempo e' arrivato un NUOVO spostamento verso
+        NS0 con timestamp piu' recente di quel rifiuto, il rifiuto e' ormai
+        obsoleto e va rivalutato invece di bloccare il titolo per sempre fino
+        alla scadenza naturale (30gg).
 - v9.8.0: OTTIMIZZAZIONE PRESTAZIONI: tre interventi per ridurre il tempo
         di esecuzione (obiettivo: < 10 minuti).
         Fix A — DEBUG_MODE: aggiunto flag --debug da riga di comando (simmetrico
@@ -327,7 +387,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.8.1'
+VERSION = '9.9.0'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -2760,117 +2820,122 @@ def get_new_creations_since_cutoff(existing_titles, cutoff_str, extra_skip=None)
     return found_titles, recreation_timestamps
 
 
-def _get_ns0_origin_timestamp(title, cutoff_date, target_title=None):
+MAX_NS0_CHAIN_DEPTH = 10   # Limite di sicurezza sulla risalita in memoria della catena NS0->NS0 (v9.9.0)
+
+
+def _resolve_ns0_chain_origin(source_title, moves_by_target, cutoff_date):
     """
-    Per una voce che ha avuto uno spostamento NS0->NS0 recente, risale la catena
-    degli spostamenti (fino a MAX_NS0_CHAIN_DEPTH log) cercando il primo evento
-    "originale" che ha portato la voce in NS0:
+    v9.9.0: risale IN MEMORIA la catena di spostamenti NS0->NS0 partendo da
+    source_title (il titolo sorgente dell'ultimo spostamento NS0->NS0),
+    usando moves_by_target: mappa titolo_destinazione -> (titolo_sorgente,
+    ns_sorgente, ns_destinazione, move_ts_str) gia' costruita da
+    get_moved_to_ns0_since_cutoff su TUTTI gli spostamenti visti nella
+    finestra di cutoff, in un solo fetch di rete. Nessuna chiamata API qui.
 
-      1. Il primo spostamento dove il namespace sorgente era != 0  (es. Bozze->NS0)
-         -> restituisce (move_timestamp_IT, 'move')
-      2. Se non trovato: la data di creazione della pagina (prima revisione)
-         -> restituisce (creation_ts_IT, 'creation')
+    Sostituisce la vecchia _get_ns0_origin_timestamp (fino a v9.8.2), la cui
+    risalita via site.logevents(page=title) non poteva funzionare: letitle
+    filtra sul titolo SORGENTE registrato al momento di ogni singolo
+    spostamento, quindi una query per source_title non trova mai lo
+    spostamento che ha CREATO source_title (loggato sotto il titolo
+    precedente nella catena, non piu' recuperabile per titolo). E' un limite
+    strutturale di MediaWiki (Phabricator T152829, T66184, T47949, ancora
+    aperti), non di pywikibot: l'API logevents non espone nemmeno un filtro
+    per pageid. Di conseguenza la vecchia funzione cadeva sempre nel fallback
+    'creation', causando il bug "Parco nazionale di Kahurangi" (voce con
+    ingresso NS0 recente ma creazione originale antica, rifiutata per errore
+    con reason 'ns0_to_ns0_old').
 
-    title: titolo SORGENTE dello spostamento NS0->NS0 (usato per i logevents).
-    target_title: titolo DESTINAZIONE dello spostamento NS0->NS0. Dopo lo spostamento,
-        il titolo sorgente e' diventato un redirect: la sua prima revisione e' quella
-        del redirect automatico (data recente), non quella della pagina originale.
-        Per il ramo 'creation' si usa quindi target_title, che contiene la storia
-        completa della pagina inclusa la revisione di creazione originale.
+    Risale finche' non trova un ingresso NS!=0->NS0 (restituisce quel
+    timestamp, tipo 'move'), o finche' la catena non esce dalla mappa in
+    memoria (nessun'origine trovata entro la finestra di cutoff): in tal
+    caso restituisce (None, None) e il chiamante ricade sul fallback
+    'creation' (data di creazione reale della pagina), esattamente come
+    prima di v9.9.0. Se il vero evento di ingresso NS0 fosse precedente al
+    cutoff, il fallback 'creation' produce comunque una data <= a quella,
+    quindi <= cutoff: il rifiuto resta corretto (nessun rischio di
+    reintrodurre voci vecchissime, vedi changelog v9.9.0).
 
-    Restituisce (timestamp_str_IT, tipo) oppure (None, None) in caso di errore.
-    La chiamata e' limitata a MAX_NS0_CHAIN_DEPTH=10 log per limitare il costo API.
+    Protetto da cicli (visited) e limitato a MAX_NS0_CHAIN_DEPTH hop.
     """
-    site = SITE
-    MAX_NS0_CHAIN_DEPTH = 10
-    try:
-        logs = list(site.logevents(
-            logtype='move',
-            page=title,
-            total=MAX_NS0_CHAIN_DEPTH
-        ))
-        # L'API restituisce dal piu' recente al piu' vecchio.
-        # Scorriamo cercando il PRIMO ingresso in NS0 da NS!=0
-        # (cioe' l'ultimo in ordine cronologico inverso che soddisfa la condizione).
-        origin_ts = None
-        origin_type = None
-        for log in logs:
-            try:
-                params = log.data.get('params', log.data)
-                # BUG FIX v9.6.5: usare log.data['ns'] invece di log.page().namespace().
-                # log.page().namespace() restituisce il namespace ATTUALE della pagina
-                # sorgente, ma dopo uno spostamento NS!=0->NS0 il titolo sorgente diventa
-                # un redirect in NS0: quindi namespace() restituisce 0 anche se al momento
-                # dello spostamento era NS118 o NS2. Questo causava il mancato rilevamento
-                # dell'ingresso originale in NS0 (es. Parco nazionale di Kahurangi).
-                # log.data['ns'] e' il namespace della pagina SORGENTE al momento dell'evento,
-                # esattamente quello che serve per risalire la catena correttamente.
-                src_ns = int(log.data.get('ns', -1))
-                tgt_title = params.get('target_title', '')
-                tgt_ns = int(params.get('target_ns', -1))
-                if src_ns == -1 or tgt_ns == -1:
-                    # Fallback se i campi non sono presenti (API piu' vecchie)
-                    src_page = log.page()
-                    src_ns = int(src_page.namespace())
-                    tgt_page = pywikibot.Page(site, tgt_title) if tgt_title else None
-                    tgt_ns = int(tgt_page.namespace()) if tgt_page else -1
-                if src_ns != 0 and tgt_ns == 0:
-                    # Trovato ingresso da NS!=0 -> questo e' l'evento originale
-                    origin_ts = ts_utc_to_it(log.timestamp())
-                    origin_type = 'move'
-                    # Non interrompiamo: vogliamo l'evento piu' vecchio (scorriamo tutto)
-            except Exception:
-                continue
-        if origin_ts is not None:
-            return origin_ts, origin_type
-
-        # Nessuno spostamento da NS!=0 trovato: la voce e' sempre stata in NS0.
-        # Usiamo la data di prima revisione (creazione diretta in NS0).
-        # IMPORTANTE: dopo uno spostamento NS0->NS0, il titolo sorgente (title) e'
-        # diventato un redirect automatico: la sua prima revisione e' quella del
-        # redirect (data recente), non quella originale. Si usa target_title, che
-        # mantiene la storia completa della pagina, per trovare la vera data di creazione.
-        creation_query_title = target_title if target_title else title
-        try:
-            params_rev = {
-                'action': 'query',
-                'prop': 'revisions',
-                'titles': creation_query_title,
-                'rvprop': 'timestamp',
-                'rvdir': 'newer',
-                'rvlimit': '1',
-                'format': 'json',
-            }
-            data = site.simple_request(**params_rev).submit()
-            pages = data.get('query', {}).get('pages', {})
-            for page_data in pages.values():
-                revs = page_data.get('revisions', [])
-                if revs:
-                    ts_raw = revs[0].get('timestamp', '')
-                    ts_clean = ts_raw.replace('-','').replace('T','').replace(':','').replace('Z','')
-                    if ts_clean:
-                        try:
-                            dt_utc = datetime.strptime(ts_clean, '%Y%m%d%H%M%S')
-                            ts_it = (dt_utc + timedelta(hours=_it_offset_for_utc(dt_utc))).strftime('%Y%m%d%H%M%S')
-                            return ts_it, 'creation'
-                        except Exception:
-                            pass
-        except Exception:
-            pass
-
-    except Exception as e:
-        print(f"    _get_ns0_origin_timestamp({title}): errore: {e}")
-
+    current_title = source_title
+    visited = set()
+    depth = 0
+    while (current_title in moves_by_target
+           and current_title not in visited
+           and depth < MAX_NS0_CHAIN_DEPTH):
+        visited.add(current_title)
+        prev_source_title, prev_source_ns, _prev_target_ns, prev_ts = moves_by_target[current_title]
+        if prev_source_ns != 0:
+            # Trovato ingresso da NS!=0 -> questo e' l'evento originale.
+            return prev_ts, 'move'
+        current_title = prev_source_title
+        depth += 1
     return None, None
+
+
+def _fetch_page_creation_timestamp(title):
+    """
+    Data di creazione (prima revisione) di 'title'. E' l'unica chiamata di
+    rete residua nel percorso NS0->NS0: scatta solo quando
+    _resolve_ns0_chain_origin() non trova un'origine in memoria entro il
+    cutoff. Logica di calcolo invariata rispetto alla vecchia
+    _get_ns0_origin_timestamp (ramo 'creation').
+
+    IMPORTANTE: va chiamata con il titolo DI DESTINAZIONE finale (quello
+    ancora esistente), non con un titolo sorgente intermedio ormai diventato
+    redirect: la storia delle revisioni segue il page_id, che sopravvive
+    agli spostamenti, quindi solo il titolo attuale espone la revisione di
+    creazione originale.
+
+    Restituisce timestamp_str_IT oppure None in caso di errore/dati assenti.
+    """
+    try:
+        params_rev = {
+            'action': 'query',
+            'prop': 'revisions',
+            'titles': title,
+            'rvprop': 'timestamp',
+            'rvdir': 'newer',
+            'rvlimit': '1',
+            'format': 'json',
+        }
+        data = SITE.simple_request(**params_rev).submit()
+        pages = data.get('query', {}).get('pages', {})
+        for page_data in pages.values():
+            revs = page_data.get('revisions', [])
+            if revs:
+                ts_raw = revs[0].get('timestamp', '')
+                ts_clean = ts_raw.replace('-', '').replace('T', '').replace(':', '').replace('Z', '')
+                if ts_clean:
+                    try:
+                        dt_utc = datetime.strptime(ts_clean, '%Y%m%d%H%M%S')
+                        return (dt_utc + timedelta(hours=_it_offset_for_utc(dt_utc))).strftime('%Y%m%d%H%M%S')
+                    except Exception:
+                        pass
+    except Exception as e:
+        print(f"    _fetch_page_creation_timestamp({title}): errore: {e}")
+    return None
 
 
 def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
     """
-    Scorre il log degli spostamenti. Raccoglie destinazioni NS0:
+    Scorre il log degli spostamenti (UN solo fetch di rete). Raccoglie
+    destinazioni NS0:
       - spostamenti NS!=0 -> NS0: inclusi direttamente
-      - spostamenti NS0 -> NS0 (rinominazioni): si risale la catena con
-        _get_ns0_origin_timestamp() per trovare l'evento originale; inclusi
-        solo se l'evento originale rientra nel cutoff.
+      - spostamenti NS0 -> NS0 (rinominazioni): l'evento originale viene
+        cercato con _resolve_ns0_chain_origin() risalendo IN MEMORIA la
+        mappa costruita in Passata 1 (nessuna chiamata API aggiuntiva,
+        v9.9.0); solo se non trovato si ricade sul fallback
+        _fetch_page_creation_timestamp() (unica chiamata di rete residua per
+        questo percorso). Inclusi solo se l'evento originale rientra nel
+        cutoff.
+
+    v9.9.0: funzione a DUE PASSATE sullo stesso fetch di rete:
+      Passata 1: legge tutti gli eventi di spostamento nella finestra di
+        cutoff e costruisce moves_by_target (titolo_destinazione -> hop),
+        necessaria per la risalita in memoria della catena NS0->NS0.
+      Passata 2: applica la logica di accettazione/rifiuto (identica a
+        prima) usando i dati gia' raccolti in Passata 1.
 
     Restituisce (found_titles, origin_timestamps) dove:
       found_titles:    dict {titolo: move_ts_str_recente}
@@ -2881,15 +2946,21 @@ def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
     origin_timestamps = {}
     checked = 0
     skipped_cached = 0
+    reactivated_stale_reject = 0
+    accepted_via_move_chain = 0
+    accepted_via_creation = 0
     now_str = now_it().strftime('%Y%m%d%H%M%S')
 
+    events = []
+    moves_by_target = {}
+
+    # ---- PASSATA 1: lettura + indicizzazione in memoria ----
     try:
         logs = site.logevents(logtype='move', total=MAX_ITERATIONS * 500)
         for log in logs:
             checked += 1
             if checked % 200 == 0:
-                print(f"    Log spostamenti: {checked} controllati, "
-                      f"{len(found_titles)} trovati, {skipped_cached} skip da cache")
+                print(f"    Log spostamenti (lettura): {checked} controllati")
             log_ts = log.timestamp()
             if log_ts.replace(tzinfo=None) < cutoff_date:
                 break
@@ -2899,54 +2970,13 @@ def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
                 target_title = params.get('target_title', '')
                 if not target_title:
                     continue
-                if target_title in existing_titles:
-                    if DEBUG_MODE:
-                        print(f"    [DEBUG SKIP existing_titles] target='{target_title}'")
-                    continue
-                cached = moves_cache.get(target_title)
-                if cached and cached.get('result') == 'rejected':
-                    # Non skippare le reason legate a calcoli errati precedenti:
-                    # vanno riprocessate con la logica corretta di v9.4+.
-                    # - 'ns0_to_ns0': residuo pre-v9.3 (reason generica)
-                    # - 'ns0_to_ns0_api_error': errore API transitorio
-                    # - 'ns0_to_ns0_old': potrebbe essere stato calcolato con
-                    #   origin_ts sbagliato (bug documentato: Parco nazionale di
-                    #   Kahurangi). Va riprocessato.
-                    # Solo 'ns0_to_ns0_ts_parse_error' e reason non-NS0->NS0
-                    # sono definitivi e non vanno riprocessati.
-                    _stale_reasons = {
-                        'ns0_to_ns0',
-                        'ns0_to_ns0_api_error',
-                        'ns0_to_ns0_old',
-                    }
-                    _reason = cached.get('reason')
-                    _skip_cached = _reason not in _stale_reasons
-                    if _skip_cached:
-                        # FIX v9.8.1 (bug 'Terremoto di Choco del 2026'): le reason
-                        # 'banali' (not_exist/redirect/ns<N>) derivano da un rifiuto
-                        # legato a un vecchio spostamento (es. NS0->Bozza senza
-                        # redirect, quindi pagina 'missing' per il bot). Se nel
-                        # frattempo e' arrivato un NUOVO spostamento verso NS0 con
-                        # timestamp piu' recente di quel rifiuto (move_ts_str e'
-                        # gia' disponibile qui, nessuna chiamata API aggiuntiva),
-                        # il rifiuto e' obsoleto e va rivalutato invece di bloccare
-                        # per sempre il titolo fino a scadenza naturale (30gg).
-                        _banal_reasons = {'not_exist', 'redirect'}
-                        _is_banal = bool(_reason) and (
-                            _reason in _banal_reasons or re.match(r'^ns\d+$', _reason))
-                        if _is_banal and move_ts_str > cached.get('processed_at', '0'):
-                            _skip_cached = False
-                    if _skip_cached:
-                        skipped_cached += 1
-                        continue
+                source_title = log.data.get('title', '') or log.page().title()
                 # FIX v9.6.7: source_ns e target_ns letti da log.data/params senza
                 # chiamate API aggiuntive (log.page().namespace() e
                 # pywikibot.Page(target_title).namespace() scatenavano una query
                 # per ogni voce nel log, raddoppiando il tempo di esecuzione).
-                # Stessa tecnica gia' usata in _get_ns0_origin_timestamp (fix v9.6.5).
                 source_ns = int(log.data.get('ns', -1))
                 target_ns = int(params.get('target_ns', -1))
-
                 if source_ns == -1:
                     # Fallback: log.data['ns'] non disponibile (API piu' vecchie)
                     source_ns = int(log.page().namespace())
@@ -2954,63 +2984,133 @@ def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
                     # Fallback: target_ns non disponibile, deduci dal titolo
                     target_ns = int(pywikibot.Page(site, target_title).namespace())
 
-                if source_ns == 0:
-                    # Spostamento NS0->NS0: risali la catena per trovare l'evento originale.
-                    # Si passa source_title (titolo SORGENTE dello spostamento) perche'
-                    # letitle filtra sul titolo sorgente del log: logevents(page=source_title)
-                    # trova gli spostamenti precedenti della voce registrati con quel titolo.
-                    # Es. catena Sandbox->A->[22mag]->B: chiamando con "A" si trova il log
-                    # Sandbox->A (28apr, NS!=0->NS0) che e' l'evento originale cercato.
-                    source_title = log.data.get('title', '') or log.page().title()
-                    origin_ts, origin_type = _get_ns0_origin_timestamp(source_title, cutoff_date, target_title=target_title)
-                    if origin_ts is None:
-                        # Errore API: scarta cautelativamente
-                        moves_cache[target_title] = {
-                            'processed_at': now_str, 'result': 'rejected',
-                            'reason': 'ns0_to_ns0_api_error'}
-                        continue
-                    try:
-                        origin_dt = datetime.strptime(origin_ts, '%Y%m%d%H%M%S')
-                    except Exception:
-                        moves_cache[target_title] = {
-                            'processed_at': now_str, 'result': 'rejected',
-                            'reason': 'ns0_to_ns0_ts_parse_error'}
-                        continue
-                    if origin_dt < cutoff_date:
-                        # Evento originale fuori dal cutoff: voce troppo vecchia
-                        moves_cache[target_title] = {
-                            'processed_at': now_str, 'result': 'rejected',
-                            'reason': 'ns0_to_ns0_old'}
-                        continue
-                    # Evento originale nel cutoff: includi la voce
-                    moves_cache[target_title] = {
-                        'processed_at': now_str, 'result': 'accepted',
-                        'reason': f'ns0_to_ns0_{origin_type}'}
-                    found_titles[target_title] = move_ts_str
-                    origin_timestamps[target_title] = origin_ts
-                    print(f"    Rinominazione NS0->NS0: '{source_title}' -> '{target_title}' "
-                          f"(origine: {origin_ts[:8]}, tipo: {origin_type})")
-                    continue
-
-                # Spostamento NS!=0 -> NS0 (logica originale)
-                if target_ns != 0:
-                    moves_cache[target_title] = {
-                        'processed_at': now_str, 'result': 'rejected',
-                        'reason': f"ns{target_ns}"}
-                    continue
-                moves_cache[target_title] = {
-                    'processed_at': now_str, 'result': 'accepted', 'reason': 'ns0'}
-                found_titles[target_title] = move_ts_str
-                source_title = log.data.get('title', '') or log.page().title()
-                print(f"    Spostamento NS{source_ns}->NS0: '{source_title}' -> '{target_title}'")
+                events.append((target_title, source_title, source_ns, target_ns, move_ts_str))
+                # Indice per _resolve_ns0_chain_origin (v9.9.0). 'logs' e'
+                # newest-first: se un target_title compare piu' volte (raro,
+                # titolo riusato), il primo incontrato e' il piu' recente,
+                # cioe' l'hop corretto da seguire risalendo a ritroso.
+                if target_title not in moves_by_target:
+                    moves_by_target[target_title] = (source_title, source_ns, target_ns, move_ts_str)
             except Exception:
                 continue
     except Exception as e:
         print(f"    Errore log spostamenti: {e}")
+        events = []
+
+    print(f"    Log spostamenti: {checked} controllati nella finestra di cutoff "
+          f"({len(events)} eventi validi), inizio Passata 2...")
+
+    # ---- PASSATA 2: accettazione/rifiuto (stessa logica di prima) ----
+    for target_title, source_title, source_ns, target_ns, move_ts_str in events:
+        try:
+            if target_title in existing_titles:
+                if DEBUG_MODE:
+                    print(f"    [DEBUG SKIP existing_titles] target='{target_title}'")
+                continue
+            cached = moves_cache.get(target_title)
+            if cached and cached.get('result') == 'rejected':
+                # Non skippare le reason legate a calcoli errati precedenti:
+                # vanno riprocessate con la logica corretta di v9.4+ (e ora v9.9.0).
+                # - 'ns0_to_ns0': residuo pre-v9.3 (reason generica)
+                # - 'ns0_to_ns0_api_error': errore API transitorio
+                # - 'ns0_to_ns0_old': potrebbe essere stato calcolato con
+                #   origin_ts sbagliato (bug documentato: Parco nazionale di
+                #   Kahurangi, risolto in v9.9.0). Va riprocessato.
+                # Solo 'ns0_to_ns0_ts_parse_error' e reason non-NS0->NS0
+                # sono definitivi e non vanno riprocessati.
+                _stale_reasons = {
+                    'ns0_to_ns0',
+                    'ns0_to_ns0_api_error',
+                    'ns0_to_ns0_old',
+                }
+                _reason = cached.get('reason')
+                _skip_cached = _reason not in _stale_reasons
+                if _skip_cached:
+                    # FIX v9.8.1 (bug 'Terremoto di Choco del 2026'): le reason
+                    # 'banali' (not_exist/redirect/ns<N>) derivano da un rifiuto
+                    # legato a un vecchio spostamento (es. NS0->Bozza senza
+                    # redirect, quindi pagina 'missing' per il bot). Se nel
+                    # frattempo e' arrivato un NUOVO spostamento verso NS0 con
+                    # timestamp piu' recente di quel rifiuto (move_ts_str e'
+                    # gia' disponibile qui, nessuna chiamata API aggiuntiva),
+                    # il rifiuto e' obsoleto e va rivalutato invece di bloccare
+                    # per sempre il titolo fino a scadenza naturale (30gg).
+                    _banal_reasons = {'not_exist', 'redirect'}
+                    _is_banal = bool(_reason) and (
+                        _reason in _banal_reasons or re.match(r'^ns\d+$', _reason))
+                    if _is_banal and move_ts_str > cached.get('processed_at', '0'):
+                        _skip_cached = False
+                        reactivated_stale_reject += 1
+                        print(f"    RIATTIVATA (era '{_reason}' in cache dal "
+                              f"{cached.get('processed_at', '?')}, nuovo spostamento "
+                              f"NS0 del {move_ts_str}): {target_title}")
+                if _skip_cached:
+                    skipped_cached += 1
+                    continue
+
+            if source_ns == 0:
+                # Spostamento NS0->NS0: risali la catena IN MEMORIA (v9.9.0,
+                # nessuna chiamata API per-voce).
+                origin_ts, origin_type = _resolve_ns0_chain_origin(
+                    source_title, moves_by_target, cutoff_date)
+                if origin_ts is None:
+                    # Nessuna origine trovata in catena entro il cutoff:
+                    # fallback alla data di creazione reale della pagina
+                    # (unica chiamata API residua in questo percorso, stessa
+                    # semantica di prima di v9.9.0).
+                    origin_ts = _fetch_page_creation_timestamp(target_title)
+                    origin_type = 'creation'
+                    if origin_ts is None:
+                        moves_cache[target_title] = {
+                            'processed_at': now_str, 'result': 'rejected',
+                            'reason': 'ns0_to_ns0_api_error'}
+                        continue
+                try:
+                    origin_dt = datetime.strptime(origin_ts, '%Y%m%d%H%M%S')
+                except Exception:
+                    moves_cache[target_title] = {
+                        'processed_at': now_str, 'result': 'rejected',
+                        'reason': 'ns0_to_ns0_ts_parse_error'}
+                    continue
+                if origin_dt < cutoff_date:
+                    # Evento originale fuori dal cutoff: voce troppo vecchia
+                    moves_cache[target_title] = {
+                        'processed_at': now_str, 'result': 'rejected',
+                        'reason': 'ns0_to_ns0_old'}
+                    continue
+                # Evento originale nel cutoff: includi la voce
+                moves_cache[target_title] = {
+                    'processed_at': now_str, 'result': 'accepted',
+                    'reason': f'ns0_to_ns0_{origin_type}'}
+                found_titles[target_title] = move_ts_str
+                origin_timestamps[target_title] = origin_ts
+                if origin_type == 'move':
+                    accepted_via_move_chain += 1
+                else:
+                    accepted_via_creation += 1
+                print(f"    Rinominazione NS0->NS0: '{source_title}' -> '{target_title}' "
+                      f"(origine: {origin_ts[:8]}, tipo: {origin_type})")
+                continue
+
+            # Spostamento NS!=0 -> NS0 (logica originale)
+            if target_ns != 0:
+                moves_cache[target_title] = {
+                    'processed_at': now_str, 'result': 'rejected',
+                    'reason': f"ns{target_ns}"}
+                continue
+            moves_cache[target_title] = {
+                'processed_at': now_str, 'result': 'accepted', 'reason': 'ns0'}
+            found_titles[target_title] = move_ts_str
+            print(f"    Spostamento NS{source_ns}->NS0: '{source_title}' -> '{target_title}'")
+        except Exception:
+            continue
 
     print(f"    Log spostamenti: {checked} controllati, "
-          f"{len(found_titles)} trovati ({len(origin_timestamps)} NS0->NS0 accettati), "
-          f"{skipped_cached} skip da cache")
+          f"{len(found_titles)} trovati ({len(origin_timestamps)} NS0->NS0 accettati: "
+          f"{accepted_via_move_chain} via catena spostamenti, {accepted_via_creation} via data creazione), "
+          f"{skipped_cached} skip da cache"
+          + (f", {reactivated_stale_reject} riattivate da rifiuto obsoleto"
+             if reactivated_stale_reject else ""))
     return found_titles, origin_timestamps
 
 
