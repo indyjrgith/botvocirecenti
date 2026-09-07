@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bot ArchiviaVociRecenti v1.3.1
+Bot ArchiviaVociRecenti v1.3.2
 
 Scansiona tutte le transclusioni di Template:ArchiviaVociRecenti, e per
 ogni pagina sorgente che lo include: se e' ora di archiviare, "subst-a"
@@ -116,6 +116,28 @@ Changelog:
         trattandosi di uno stato normale di funzionamento (non un errore)
         quando la pulizia e' attiva. Comportamento invariato quando
         pulizia == off: il bot esce subito con l'avviso, come prima.
+- v1.3.2: Nuovo: i valori dei parametri dell'istanza {{ArchiviaVociRecenti}}
+        (pagina, giorni, intestazione, forza, pulizia) che contengono
+        '{{' vengono ora espansi via action=expandtemplates (funzione
+        expand_param_value) prima della validazione, cosi' funzioni
+        parser e parametri magici come {{LOCALMONTH}}/{{LOCALYEAR}}
+        vengono risolti (es. pagina=Archivio {{LOCALMONTH}} {{LOCALYEAR}}
+        -> "Archivio settembre 2026"), come gia' avviene implicitamente
+        per i parametri del modulo Lua VociRecenti. I valori senza '{{'
+        non vengono toccati, per non sprecare chiamate API. Se
+        l'espansione fallisce (eccezione), si procede con il valore
+        grezzo non espanso invece di interrompere l'elaborazione della
+        pagina. validate_archivia_params ora verifica anche che il
+        titolo risultante in 'pagina' sia sintatticamente valido per
+        MediaWiki (tentativo di costruzione pywikibot.Page in try/except):
+        se non lo e' (es. '{{'/'}}' residue da un'espansione fallita, o
+        un titolo malformato indipendentemente da funzioni parser),
+        l'errore rientra nel normale flusso 'parametri-non-validi' con
+        avviso in talk, invece di propagare un'eccezione non gestita.
+        Protetta per lo stesso motivo anche la costruzione di notice_page
+        in process_page (fallback alla pagina sorgente in caso di
+        eccezione), dato che viene eseguita anche quando i parametri
+        risultano non validi.
 """
 
 import pywikibot
@@ -208,7 +230,7 @@ SAVE_CONFLICT_RETRIES = 2
 # l'altro bot del progetto.
 CLEANUP_API_CHUNK_SIZE = 50
 
-VERSION = '1.3.1'
+VERSION = '1.3.2'
 
 config.put_throttle = 1
 config.minthrottle = 0
@@ -498,6 +520,22 @@ def validate_archivia_params(params):
         result['errore'] = (
             'Errore: namespace errato. Sono ammessi i namespace Wikipedia:, '
             'Utente:, Progetto:, Portale: e le rispettive talk'
+        )
+        return result
+
+    # Verifica che il titolo sia sintatticamente valido per MediaWiki.
+    # Puo' non esserlo se contiene una funzione parser/parametro che non
+    # e' stato possibile espandere (residuo di '{{'/'}}' o altri
+    # caratteri non ammessi nei titoli), sia che il parametro 'pagina'
+    # non contenesse affatto funzioni parser ma fosse comunque malformato.
+    try:
+        pywikibot.Page(SITE, pagina)
+    except Exception as e:
+        result['errore'] = (
+            f'Errore: il titolo indicato nel parametro "pagina" non e\' '
+            f'valido per MediaWiki ({e}). Se il valore contiene funzioni '
+            f'parser (es. {{{{LOCALMONTH}}}}), verificare che siano state '
+            f'espanse correttamente.'
         )
         return result
 
@@ -1035,6 +1073,36 @@ def should_archive(archive_page, giorni, forza):
     return (today_date - last_date).days >= giorni
 
 
+def expand_param_value(page_title, raw_value):
+    """
+    Espande funzioni parser/parametri magici (es. {{LOCALMONTH}},
+    {{LOCALYEAR}}, {{#if:...}}) presenti nel valore di un singolo
+    parametro dell'istanza {{ArchiviaVociRecenti|...}}, replicando cio'
+    che il modulo Lua VociRecenti ottiene gratuitamente perche' i suoi
+    parametri arrivano gia' espansi da MediaWiki. Qui invece i parametri
+    sono estratti da parse_params() con un parsing puramente testuale,
+    quindi vanno espansi esplicitamente via action=expandtemplates (mai
+    action=parse).
+
+    Chiamata solo sui valori che contengono '{{' (vedi process_page), per
+    non sprecare chiamate API sui parametri senza funzioni parser.
+
+    In caso di eccezione nella chiamata, non blocca l'elaborazione della
+    pagina: restituisce il valore grezzo non espanso, cosi' un'eventuale
+    invalidita' del risultato (es. titolo con '{{'/'}}' residue) viene
+    comunque intercettata piu' avanti dalla normale validazione dei
+    parametri (validate_archivia_params), che la segnala con il consueto
+    avviso 'parametri-non-validi' in talk invece di un'eccezione non
+    gestita.
+    """
+    try:
+        return SITE.expand_text(text=raw_value, title=page_title)
+    except Exception as e:
+        print(f"  WARNING: espansione fallita per il valore parametro "
+              f"{raw_value!r} ({e}), uso il valore grezzo.")
+        return raw_value
+
+
 def expand_instance(page_title, raw_text):
     """
     Espande un'istanza {{VociRecenti|...}} via action=expandtemplates
@@ -1100,12 +1168,30 @@ def process_page(page):
 
     raw_a = text[spans_a[0][0]:spans_a[0][1]]
     params = parse_params(raw_a)
+
+    # Espande funzioni parser/parametri magici eventualmente presenti nei
+    # valori dei parametri (es. pagina={{LOCALMONTH}} {{LOCALYEAR}} ->
+    # "settembre 2026"), come gia' avviene implicitamente per i parametri
+    # del modulo Lua VociRecenti. Solo i valori che contengono '{{' vengono
+    # passati all'espansione, per non sprecare chiamate API sugli altri.
+    for key, value in list(params.items()):
+        if '{{' in value:
+            params[key] = expand_param_value(title, value).strip()
+
     v = validate_archivia_params(params)
 
     # Da qui in avanti, se il titolo della pagina di archivio e'
     # risolvibile, tutti gli avvisi del bot vanno sulla SUA talk (non su
     # quella della pagina sorgente): e' li' che chi la gestisce guarda.
-    notice_page = pywikibot.Page(SITE, v['pagina']) if v['pagina'] else page
+    # La costruzione e' protetta perche' viene eseguita anche quando
+    # v['ok'] e' False (es. titolo ancora non valido dopo un tentativo di
+    # espansione fallito): senza guardia, un'eccezione qui non verrebbe
+    # intercettata dal normale flusso 'parametri-non-validi' e finirebbe
+    # nel generico except imprevisto del ciclo in main().
+    try:
+        notice_page = pywikibot.Page(SITE, v['pagina']) if v['pagina'] else page
+    except Exception:
+        notice_page = page
 
     if not v['ok']:
         post_talk_notice_once(notice_page, 'parametri-non-validi', v['errore'])
