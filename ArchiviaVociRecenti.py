@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bot ArchiviaVociRecenti v1.3.2
+Bot ArchiviaVociRecenti v1.3.3
 
 Scansiona tutte le transclusioni di Template:ArchiviaVociRecenti, e per
 ogni pagina sorgente che lo include: se e' ora di archiviare, "subst-a"
@@ -138,6 +138,42 @@ Changelog:
         in process_page (fallback alla pagina sorgente in caso di
         eccezione), dato che viene eseguita anche quando i parametri
         risultano non validi.
+- v1.3.3: Rispetto dell'ordine di visualizzazione di {{VociRecenti}}
+        (parametri Order/DispScroll/Disp) nelle sezioni gia' archiviate.
+        Nuove funzioni get_effective_order_disp (replica la
+        normalizzazione del modulo Lua VociRecenti: order in
+        'data'/'dataold'/'alpha', default 'data'; disp da DispScroll o
+        Disp, default 's'), parse_voce_datetime (estrae dd/mm/yyyy hh:mm
+        dal testo della riga voce, presente solo con disp='o'/'v') e
+        try_sort_voci (applica il riordino SOLO se ricavabile dal testo:
+        sempre per order='alpha'; per order='data'/'dataold' solo con
+        disp='o'/'v' e solo se OGNI riga ha una data valida, altrimenti
+        nessuna riga viene toccata, senza chiamate API aggiuntive per
+        recuperare date mancanti). Nuova merge_existing_section (usata
+        da merge_marker_sections al posto della sola append_new_entries
+        per le sezioni gia' esistenti in archivio): se il riordino e'
+        applicabile, ricostruisce l'intera lista di voci (esistenti +
+        nuove) nell'ordine configurato, preservando invariato solo il
+        prefisso della sezione (etichetta/intestazione, tutto cio' che
+        precede la prima riga voce); altrimenti delega interamente ad
+        append_new_entries (comportamento invariato). L'archivio e'
+        gestito esclusivamente dal bot, quindi e' sicuro ricostruire le
+        righe voce di una sezione quando viene riordinata. Order/Disp
+        sono letti dal testo grezzo di ciascuna istanza VociRecenti
+        sorgente (indipendentemente da eventuali errori di espansione)
+        e propagati fino a source_instances tramite
+        build_source_instances, che ora richiede anche
+        order_disp_by_index. merge_marker_sections restituisce ora
+        anche n_reordered (conteggio delle SEZIONI il cui body e'
+        effettivamente cambiato per via del riordino, non delle singole
+        righe: se non cambia nulla di osservabile nel testo finale, la
+        sezione non viene contata). build_final_text/il salvataggio
+        considerano n_reordered insieme a n_new/n_removed (skip
+        salvataggio solo se tutti e tre sono zero), e il summary di
+        modifica e i log DRY-RUN/OK menzionano anche le sezioni
+        riordinate. Il ramo "nuova sezione" (nessun marcatore
+        combaciante in archivio) resta invariato: le righe arrivano
+        gia' ordinate dal modulo Lua per quell'istanza.
 """
 
 import pywikibot
@@ -230,7 +266,7 @@ SAVE_CONFLICT_RETRIES = 2
 # l'altro bot del progetto.
 CLEANUP_API_CHUNK_SIZE = 50
 
-VERSION = '1.3.2'
+VERSION = '1.3.3'
 
 config.put_throttle = 1
 config.minthrottle = 0
@@ -611,6 +647,93 @@ def dedup_instance_lines(lines):
 
 
 # ========================================
+# ORDINAMENTO VOCI (parametri Order/Disp di {{VociRecenti}})
+#
+# Replica la normalizzazione del modulo Lua VociRecenti per decidere se e
+# come rispettare l'ordine di visualizzazione configurato sulla singola
+# istanza sorgente. Se l'ordine non e' ricavabile dal testo (es. data non
+# mostrata con disp='s'/'t', o riga senza data valida), il bot NON tenta
+# di recuperarlo altrove: si comporta come prima di questa feature
+# (semplice append in fondo).
+# ========================================
+
+def get_effective_order_disp(raw_instance_text):
+    """Determina order/disp effettivi di un'istanza {{VociRecenti|...}}.
+    order in ('data','dataold','alpha'), default 'data' se assente o non
+    valido. disp da DispScroll (parte prima della virgola) se
+    valorizzato, altrimenti da Disp, in ('s','v','o','t','h'), default
+    's' se assente o non valido."""
+    params = parse_params(raw_instance_text)
+
+    order = (params.get('order') or 'data').strip().lower()
+    if order not in ('data', 'dataold', 'alpha'):
+        order = 'data'
+
+    dispscroll = (params.get('dispscroll') or '').strip().lower()
+    if dispscroll:
+        disp = dispscroll.split(',', 1)[0].strip()
+    else:
+        disp = (params.get('disp') or 's').strip().lower()
+    if disp not in ('s', 'v', 'o', 't', 'h'):
+        disp = 's'
+
+    return order, disp
+
+
+_VOCE_DATE_RE = re.compile(r'(\d{2})/(\d{2})/(\d{4})\s+(\d{2}):(\d{2})')
+
+def parse_voce_datetime(line):
+    """Estrae la data/ora testuale (dd/mm/yyyy hh:mm) da una riga voce,
+    se presente (compare nel testo solo con disp='o'/'v', anche
+    all'interno di corsivo wiki ''...'' per le voci spostate: la regex
+    cerca il pattern numerico ovunque nella riga). Restituisce None se
+    non trovata o se la data non e' valida (es. 31/02/2026): non
+    solleva mai eccezioni, il chiamante interpreta None come 'non
+    ricavabile'."""
+    m = _VOCE_DATE_RE.search(line)
+    if not m:
+        return None
+    day, month, year, hour, minute = m.groups()
+    try:
+        return datetime(int(year), int(month), int(day), int(hour), int(minute))
+    except ValueError:
+        return None
+
+
+def try_sort_voci(lines, order, disp):
+    """Riordina lines secondo order/disp SE E SOLO SE l'ordine e'
+    effettivamente ricavabile dal testo di ogni riga (safety net).
+    Restituisce (sorted_lines, applied): se applied=False, sorted_lines
+    e' identica a lines (nessuna riga toccata, nessun riordino)."""
+    if order == 'alpha':
+        sorted_lines = sorted(lines, key=lambda l: (voce_key(l).lower(), l))
+        return sorted_lines, True
+
+    if order in ('data', 'dataold'):
+        if disp not in ('o', 'v'):
+            # La data non compare nel testo con questo disp: non
+            # ricavabile senza chiamate API aggiuntive (non richieste).
+            return lines, False
+
+        parsed = [parse_voce_datetime(l) for l in lines]
+        if any(dt is None for dt in parsed):
+            # Almeno una riga senza data valida: non applicabile,
+            # nessuna riga toccata.
+            return lines, False
+
+        # Tie-break alfabetico sempre ASCENDENTE, indipendentemente dal
+        # verso dell'ordinamento per data: si ottiene ordinando prima
+        # per chiave alfabetica (stabile) e poi per data (sort stabile
+        # di Python: a parita' di data l'ordine alfabetico e' preservato).
+        pairs = sorted(zip(lines, parsed), key=lambda p: voce_key(p[0]).lower())
+        pairs = sorted(pairs, key=lambda p: p[1], reverse=(order == 'data'))
+        sorted_lines = [l for l, _ in pairs]
+        return sorted_lines, True
+
+    return lines, False
+
+
+# ========================================
 # PULIZIA ARCHIVIO (parametro pulizia=on/si/lasciaredirect)
 # ========================================
 
@@ -796,21 +919,26 @@ def compute_section_marker_ids(labels):
     return ids
 
 
-def build_source_instances(text, spans_a, spans_v, expanded_by_index):
+def build_source_instances(text, spans_a, spans_v, expanded_by_index, order_disp_by_index):
     """
     Costruisce, per ogni istanza VociRecenti della sorgente, l'etichetta
-    (testo grezzo che la precede), il marcatore a hash corrispondente e le
-    voci (deduplicate esclusivamente all'interno della singola istanza).
+    (testo grezzo che la precede), il marcatore a hash corrispondente, le
+    voci (deduplicate esclusivamente all'interno della singola istanza)
+    e l'order/disp effettivi di quell'istanza (per il riordino in
+    archivio, vedi merge_existing_section).
     """
     labels = compute_instance_labels(text, spans_a, spans_v)
     marker_ids = compute_section_marker_ids(labels)
 
     instances = []
     for idx in range(len(spans_v)):
+        order, disp = order_disp_by_index[idx]
         instances.append({
             'marker_id': marker_ids[idx],
             'label': labels[idx],
             'lines': dedup_instance_lines(expanded_by_index[idx]),
+            'order': order,
+            'disp': disp,
         })
     return instances
 
@@ -877,6 +1005,52 @@ def append_new_entries(existing_body, new_lines):
     return body, len(to_append)
 
 
+def merge_existing_section(existing_body, new_lines, order, disp):
+    """Come append_new_entries, ma se il riordino e' applicabile
+    (order/disp dell'istanza sorgente, vedi try_sort_voci) ricostruisce
+    l'intera lista di voci della sezione (esistenti + nuove) nell'ordine
+    configurato, invece di limitarsi ad accodare in fondo. Se il
+    riordino non e' applicabile, delega interamente ad
+    append_new_entries (comportamento invariato).
+
+    Restituisce (new_body, n_new, changed): changed indica se il body
+    risultante e' effettivamente diverso da existing_body (usato dal
+    chiamante per contare le sezioni davvero riordinate)."""
+    existing_lines = extract_voci(existing_body)
+    existing_keys = {voce_key(line) for line in existing_lines}
+
+    to_append = []
+    for line in new_lines:  # gia' deduplicate internamente all'istanza
+        key = voce_key(line)
+        if key in existing_keys:
+            continue
+        to_append.append(line)
+        existing_keys.add(key)
+
+    all_lines = existing_lines + to_append
+    sorted_lines, applied = try_sort_voci(all_lines, order, disp)
+
+    if not applied:
+        new_body, n_new = append_new_entries(existing_body, new_lines)
+        return new_body, n_new, False
+
+    # Prefisso preservato invariato: tutto cio' che nel body esistente
+    # precede la prima riga voce (etichetta/intestazione della sezione).
+    # L'archivio e' gestito esclusivamente dal bot, quindi e' sicuro
+    # ricostruire l'intera lista di righe voce quando si riordina.
+    voce_matches = list(VOCE_LINE_RE.finditer(existing_body))
+    prefix = existing_body[:voce_matches[0].start()] if voce_matches else existing_body
+
+    body = prefix
+    if body and not body.endswith('\n'):
+        body += '\n'
+    if sorted_lines:
+        body += '\n'.join(sorted_lines) + '\n'
+
+    changed = (body != existing_body)
+    return body, len(to_append), changed
+
+
 def merge_marker_sections(existing_block_text, source_instances):
     """
     Fonde le nuove voci nell'archivio esistente accoppiando le sezioni
@@ -891,18 +1065,26 @@ def merge_marker_sections(existing_block_text, source_instances):
       sezione conservata intatta in fondo, nell'ordine originale
       dell'archivio (Caso B, mai cancellata).
 
-    Restituisce (merged_block, n_new, ok). ok=False indica struttura non
-    riconoscibile (Caso C): il chiamante non deve modificare l'archivio.
+    Se per un'istanza sorgente l'ordine (Order/Disp) e' ricavabile dal
+    testo, la sezione esistente combaciante viene ricostruita rispettando
+    quell'ordine (vedi merge_existing_section); altrimenti si accoda in
+    fondo come sempre.
+
+    Restituisce (merged_block, n_new, n_reordered, ok). ok=False indica
+    struttura non riconoscibile (Caso C): il chiamante non deve
+    modificare l'archivio. n_reordered conta le SEZIONI il cui body e'
+    effettivamente cambiato per via del riordino (non le singole righe).
     """
     ok, preamble, existing_sections = parse_marker_sections(existing_block_text)
     if not ok:
-        return None, 0, False
+        return None, 0, 0, False
 
     existing_by_id = {sec['marker_id']: sec for sec in existing_sections}
     used_ids = set()
 
     output_parts = [preamble] if preamble else []
     total_new = 0
+    total_reordered = 0
 
     # NB: 'body' include SEMPRE la propria interruzione di riga iniziale
     # (che separa il marcatore dal contenuto). Il marcatore viene quindi
@@ -916,7 +1098,11 @@ def merge_marker_sections(existing_block_text, source_instances):
 
         if existing_sec is not None:
             used_ids.add(marker_id)
-            body, n_new = append_new_entries(existing_sec['body'], inst['lines'])
+            body, n_new, changed = merge_existing_section(
+                existing_sec['body'], inst['lines'], inst['order'], inst['disp']
+            )
+            if changed:
+                total_reordered += 1
         else:
             label = inst['label']
             body = label if label.startswith('\n') else '\n' + label
@@ -935,7 +1121,7 @@ def merge_marker_sections(existing_block_text, source_instances):
         if sec['marker_id'] not in used_ids:
             output_parts.append(section_marker(sec['marker_id']) + sec['body'])
 
-    return ''.join(output_parts), total_new, True
+    return ''.join(output_parts), total_new, total_reordered, True
 
 
 def build_heading(intestazione_param, data_it):
@@ -1246,10 +1432,14 @@ def process_page(page):
     # La stessa voce puo' appartenere a istanze diverse: la deduplica
     # viene applicata esclusivamente all'interno della singola istanza.
     expanded_by_index = {}
+    order_disp_by_index = {}
     any_instance_error = False
 
     for idx, (s, e) in enumerate(spans_v):
         raw_v = text[s:e]
+        # Order/Disp si leggono dal testo grezzo dell'istanza, non
+        # dall'espansione: disponibili anche se expand_instance fallisce.
+        order_disp_by_index[idx] = get_effective_order_disp(raw_v)
         expanded, has_error = expand_instance(title, raw_v)
         if has_error or expanded is None:
             any_instance_error = True
@@ -1276,7 +1466,9 @@ def process_page(page):
     # Ricostruisce la struttura della sorgente: ogni VociRecenti e'
     # accoppiata alla sezione archiviata corrispondente tramite un
     # marcatore a hash calcolato sul testo grezzo che la precede.
-    source_instances = build_source_instances(text, spans_a, spans_v, expanded_by_index)
+    source_instances = build_source_instances(
+        text, spans_a, spans_v, expanded_by_index, order_disp_by_index
+    )
 
     def build_final_text():
         try:
@@ -1288,9 +1480,9 @@ def process_page(page):
             archive_text, archive_page.title()
         )
 
-        merged_block, n_new, ok = merge_marker_sections(block, source_instances)
+        merged_block, n_new, n_reordered, ok = merge_marker_sections(block, source_instances)
         if not ok:
-            return None, 0, 0, False
+            return None, 0, 0, 0, False
 
         # Pulizia sull'intero blocco bot gia' fuso (tutte le sezioni
         # dell'archivio, non solo quelle appena toccate in questo
@@ -1308,9 +1500,9 @@ def process_page(page):
         final_text += BOT_START_MARKER + '\n\n'
         final_text += merged_block.strip('\n')
         final_text += '\n\n' + BOT_END_MARKER + after
-        return final_text, n_new, n_removed, True
+        return final_text, n_new, n_removed, n_reordered, True
 
-    final_text, n_new, n_removed, ok = build_final_text()
+    final_text, n_new, n_removed, n_reordered, ok = build_final_text()
 
     if not ok:
         post_talk_notice_once(
@@ -1335,8 +1527,8 @@ def process_page(page):
         print("  Dimensione massima superata, salvataggio annullato.")
         return
 
-    if n_new == 0 and n_removed == 0:
-        print("  Nessuna voce nuova da archiviare e nessuna voce da rimuovere, skip salvataggio.")
+    if n_new == 0 and n_removed == 0 and n_reordered == 0:
+        print("  Nessuna voce nuova, nessuna rimozione e nessun riordino, skip salvataggio.")
         return
 
     summary_parts = []
@@ -1344,10 +1536,12 @@ def process_page(page):
         summary_parts.append(f'{n_new} nuove voci archiviate')
     if n_removed:
         summary_parts.append(f'{n_removed} voci rimosse (pulizia)')
+    if n_reordered:
+        summary_parts.append(f'{n_reordered} sezioni riordinate')
     summary = f"Bot: {'; '.join(summary_parts)} (v.{VERSION})"
 
     if DRY_RUN:
-        print(f"[DRY-RUN] Salverei: {n_new} nuove voci, {n_removed} voci rimosse su {v['pagina']} ({len(final_text)} caratteri).")
+        print(f"[DRY-RUN] Salverei: {n_new} nuove voci, {n_removed} voci rimosse, {n_reordered} sezioni riordinate su {v['pagina']} ({len(final_text)} caratteri).")
         return
 
     attempts = 0
@@ -1355,7 +1549,7 @@ def process_page(page):
         try:
             archive_page.text = final_text
             archive_page.save(summary=summary, minor=True, bot=True)
-            print(f"  OK - {n_new} nuove voci archiviate, {n_removed} voci rimosse su {v['pagina']}.")
+            print(f"  OK - {n_new} nuove voci archiviate, {n_removed} voci rimosse, {n_reordered} sezioni riordinate su {v['pagina']}.")
             return
         except pywikibot.exceptions.EditConflictError:
             attempts += 1
@@ -1363,7 +1557,7 @@ def process_page(page):
                 print(f"  ERRORE: edit conflict persistente su {v['pagina']} dopo {SAVE_CONFLICT_RETRIES} tentativi, skip.")
                 return
             print(f"  Edit conflict su {v['pagina']}, ricarico e riapplico il merge (tentativo {attempts}/{SAVE_CONFLICT_RETRIES})...")
-            final_text, n_new, n_removed, ok = build_final_text()
+            final_text, n_new, n_removed, n_reordered, ok = build_final_text()
             if not ok:
                 post_talk_notice_once(
                     archive_page, 'archivio-struttura-non-riconosciuta',
@@ -1376,8 +1570,8 @@ def process_page(page):
                 )
                 print("  Struttura archivio non riconoscibile dopo ricarico, salvataggio annullato.")
                 return
-            if n_new == 0 and n_removed == 0:
-                print("  Dopo il ricalcolo non ci sono piu' voci nuove ne' da rimuovere, skip.")
+            if n_new == 0 and n_removed == 0 and n_reordered == 0:
+                print("  Dopo il ricalcolo non ci sono piu' voci nuove, rimozioni ne' riordini, skip.")
                 return
         except Exception as e:
             print(f"  ERRORE salvataggio su {v['pagina']}: {e}")
