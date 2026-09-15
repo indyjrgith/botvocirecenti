@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.10.1
+Bot VociRecenti v9.10.2
 
 Changelog:
+- v9.10.2: Aggiunto log di progresso per ogni batch di purge_template_transclusions
+        (numero batch/totale, pagine purgate finora, tempo impiegato), sul modello
+        degli altri _fmt_elapsed gia' usati nel bot. In precedenza c'era un solo
+        print finale a fine ciclo (o uno per batch fallito), quindi durante un
+        run lungo o appeso non c'era modo di capire dall'.out a che punto fosse
+        arrivato il purge.
 - v9.10.1: FIX: PURGE_BATCH_SIZE ridotto da 500 a 50 (coerente con
         CLEANUP_BATCH_SIZE). Un batch da 500 pagine con forcelinkupdate=True
         in un'unica chiamata action=purge puo' restare appeso per decine di
@@ -441,7 +447,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.10.1'
+VERSION = '9.10.2'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -3392,13 +3398,19 @@ def purge_template_transclusions():
 
     print(f"  Pagine trovate: {len(pages)}")
     purged = 0
+    n_batches = (len(pages) + PURGE_BATCH_SIZE - 1) // PURGE_BATCH_SIZE
     for i in range(0, len(pages), PURGE_BATCH_SIZE):
+        batch_num = i // PURGE_BATCH_SIZE + 1
         batch = pages[i:i + PURGE_BATCH_SIZE]
+        _t_batch = datetime.now()
         try:
             SITE.purgepages(batch, forcelinkupdate=True)
             purged += len(batch)
+            _elapsed_batch = _fmt_elapsed((datetime.now() - _t_batch).total_seconds())
+            print(f"  Batch {batch_num}/{n_batches} OK ({purged}/{len(pages)} purgate) ({_elapsed_batch})")
         except Exception as e:
-            print(f"  ERRORE purge batch {i // PURGE_BATCH_SIZE + 1}: {e}")
+            _elapsed_batch = _fmt_elapsed((datetime.now() - _t_batch).total_seconds())
+            print(f"  ERRORE purge batch {batch_num}/{n_batches} ({_elapsed_batch}): {e}")
 
     print(f"  OK Purgate {purged}/{len(pages)} pagine")
     return purged
