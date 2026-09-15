@@ -1,8 +1,21 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.10.2
+Bot VociRecenti v9.10.3
 
 Changelog:
+- v9.10.3: FIX: purge_template_transclusions() restava bloccato indefinitamente
+        alla primissima chiamata SITE.purgepages(batch, forcelinkupdate=True)
+        (nessun log oltre "Pagine trovate: N"), perche' la variabile TIMEOUT
+        era definita ma non applicata da nessuna parte. Ogni batch viene ora
+        eseguito in un thread dedicato (ThreadPoolExecutor) e atteso al
+        massimo TIMEOUT secondi (300s): se scade, il batch viene abbandonato
+        (loggato come ERRORE TIMEOUT, non conteggiato tra i purgati) e si
+        passa al batch successivo senza bloccare il resto del run. Il thread
+        eventualmente ancora bloccato prosegue in background (non e'
+        possibile terminarlo forzatamente da Python), ma l'executor viene
+        chiuso con wait=False per non restare appeso a fine funzione.
+        Contestualmente PURGE_BATCH_SIZE ridotto da 50 a 30 per ridurre
+        ulteriormente il rischio di batch troppo pesanti lato server.
 - v9.10.2: Aggiunto log di progresso per ogni batch di purge_template_transclusions
         (numero batch/totale, pagine purgate finora, tempo impiegato), sul modello
         degli altri _fmt_elapsed gia' usati nel bot. In precedenza c'era un solo
@@ -447,7 +460,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.10.2'
+VERSION = '9.10.3'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -516,7 +529,7 @@ CACHE_PARSED_PAGE = 'Utente:BotVociRecenti/CacheParsed'
 # Disattivabile da riga di comando con --no-purge.
 PURGE_ENABLED       = True
 PURGE_TEMPLATE_NAME = 'Template:VociRecenti'
-PURGE_BATCH_SIZE    = 50    # titoli per chiamata purge con forcelinkupdate (ridotto da 500: causava richieste troppo lunghe/bloccanti)
+PURGE_BATCH_SIZE    = 30    # titoli per chiamata purge con forcelinkupdate (ridotto da 500->50->30: causava richieste troppo lunghe/bloccanti)
 # ========================================
 
 SITE = pywikibot.Site('it', 'wikipedia')
@@ -3399,18 +3412,32 @@ def purge_template_transclusions():
     print(f"  Pagine trovate: {len(pages)}")
     purged = 0
     n_batches = (len(pages) + PURGE_BATCH_SIZE - 1) // PURGE_BATCH_SIZE
-    for i in range(0, len(pages), PURGE_BATCH_SIZE):
-        batch_num = i // PURGE_BATCH_SIZE + 1
-        batch = pages[i:i + PURGE_BATCH_SIZE]
-        _t_batch = datetime.now()
-        try:
-            SITE.purgepages(batch, forcelinkupdate=True)
-            purged += len(batch)
-            _elapsed_batch = _fmt_elapsed((datetime.now() - _t_batch).total_seconds())
-            print(f"  Batch {batch_num}/{n_batches} OK ({purged}/{len(pages)} purgate) ({_elapsed_batch})")
-        except Exception as e:
-            _elapsed_batch = _fmt_elapsed((datetime.now() - _t_batch).total_seconds())
-            print(f"  ERRORE purge batch {batch_num}/{n_batches} ({_elapsed_batch}): {e}")
+    # Executor dedicato al purge: ogni batch viene lanciato in un thread e
+    # atteso al massimo TIMEOUT secondi. Se scade, il batch viene abbandonato
+    # e si passa al successivo (il thread bloccato puo' continuare in
+    # background senza pero' fermare il resto del bot). L'executor NON viene
+    # chiuso in modo bloccante (wait=False), per non restare appeso a fine
+    # funzione in attesa di eventuali thread ancora pendenti.
+    _purge_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        for i in range(0, len(pages), PURGE_BATCH_SIZE):
+            batch_num = i // PURGE_BATCH_SIZE + 1
+            batch = pages[i:i + PURGE_BATCH_SIZE]
+            _t_batch = datetime.now()
+            future = _purge_executor.submit(SITE.purgepages, batch, forcelinkupdate=True)
+            try:
+                future.result(timeout=TIMEOUT)
+                purged += len(batch)
+                _elapsed_batch = _fmt_elapsed((datetime.now() - _t_batch).total_seconds())
+                print(f"  Batch {batch_num}/{n_batches} OK ({purged}/{len(pages)} purgate) ({_elapsed_batch})")
+            except concurrent.futures.TimeoutError:
+                _elapsed_batch = _fmt_elapsed((datetime.now() - _t_batch).total_seconds())
+                print(f"  ERRORE TIMEOUT purge batch {batch_num}/{n_batches} (scaduto dopo {TIMEOUT}s, {_elapsed_batch}) - batch abbandonato, proseguo")
+            except Exception as e:
+                _elapsed_batch = _fmt_elapsed((datetime.now() - _t_batch).total_seconds())
+                print(f"  ERRORE purge batch {batch_num}/{n_batches} ({_elapsed_batch}): {e}")
+    finally:
+        _purge_executor.shutdown(wait=False)
 
     print(f"  OK Purgate {purged}/{len(pages)} pagine")
     return purged
