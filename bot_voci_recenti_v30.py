@@ -1,8 +1,27 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.9.1
+Bot VociRecenti v9.10.0
 
 Changelog:
+- v9.10.0: NUOVA FUNZIONALITA': purge con forcelinkupdate=True di tutte le
+        pagine che trascludono Template:VociRecenti, eseguito a fine STEP 7
+        subito dopo blank_old_data_files. Motivazione: la visualizzazione
+        diretta di una pagina col template mostra dati aggiornati non
+        appena la parser cache viene invalidata dal job refreshLinks, ma
+        le liste ottenute via API (es. AWB "Links on page", che legge la
+        tabella pagelinks) restavano indietro finche' quel job non veniva
+        processato dalla coda, con ritardi anche di ore. Nuova funzione
+        purge_template_transclusions(): recupera le transclusioni con
+        Page.embeddedin(), le purga in batch da PURGE_BATCH_SIZE (500,
+        limite per bot flag di action=purge) - per le (anche) centinaia di
+        pagine attese (Utente:/Portale:/Progetto: e talk) restano 1-2
+        chiamate API totali. Nessun filtro di namespace (tutte le
+        transclusioni vanno purgate). Skip completo in DRY_RUN; disattivabile
+        anche in run reale con --no-purge (nuovo flag CLI, simmetrico a
+        --dry-run/--debug) o impostando PURGE_ENABLED=False. try/except
+        non bloccante: un errore di purge non compromette l'esito del run,
+        che a quel punto ha gia' salvato correttamente la cache Lua.
+        Nessuna modifica al formato dei file Lua ne' a moves_cache.json.
 - v9.9.1: OTTIMIZZAZIONE PRESTAZIONI: STEP 2 (pulizia cache) passava da 7-8 a
         25 minuti man mano che la cache cresceva (3838 voci), perche' la
         FASE 3 (_cleanup_check_and_update_pages_batch) recupera le categorie
@@ -417,7 +436,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.9.1'
+VERSION = '9.10.0'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -475,6 +494,18 @@ NS_SCAN = [2, 118]
 # Cache voci da altri namespace
 CACHE_MOVED_PAGE  = 'Utente:BotVociRecenti/CacheMoved'
 CACHE_PARSED_PAGE = 'Utente:BotVociRecenti/CacheParsed'
+
+# --- Purge transclusioni Template:VociRecenti ---
+# Dopo il salvataggio della cache Lua, le pagine che trascludono il
+# template mostrano dati aggiornati se visualizzate direttamente (parser
+# cache aggiornata dal job refreshLinks), ma le liste ottenute via API
+# (es. AWB "Links on page") restano ferme finche' la tabella pagelinks
+# non viene rigenerata. purgepages(forcelinkupdate=True) forza subito
+# quella rigenerazione, senza attendere la coda dei job.
+# Disattivabile da riga di comando con --no-purge.
+PURGE_ENABLED       = True
+PURGE_TEMPLATE_NAME = 'Template:VociRecenti'
+PURGE_BATCH_SIZE    = 500   # max titoli per chiamata action=purge (bot flag)
 # ========================================
 
 SITE = pywikibot.Site('it', 'wikipedia')
@@ -3329,6 +3360,45 @@ def blank_old_data_files(num_files_needed):
     return blanked
 
 
+def purge_template_transclusions():
+    """
+    Purga con forcelinkupdate=True tutte le pagine che trascludono
+    PURGE_TEMPLATE_NAME, per rigenerare subito la tabella pagelinks
+    (altrimenti resta ferma fino al passaggio della coda job refreshLinks,
+    disallineando le liste ottenute via API — es. AWB "Links on page" —
+    anche quando la visualizzazione diretta della pagina e' gia' aggiornata).
+    In DRY_RUN non esegue alcuna chiamata. Non blocca il run in caso di errore.
+    """
+    print(f"\nPurge transclusioni {PURGE_TEMPLATE_NAME}...")
+    if DRY_RUN:
+        print(f"  [DRY-RUN] Skip purge")
+        return 0
+
+    try:
+        tmpl_page = pywikibot.Page(SITE, PURGE_TEMPLATE_NAME)
+        pages = list(tmpl_page.embeddedin(total=None))
+    except Exception as e:
+        print(f"  ERRORE recupero transclusioni: {e}")
+        return 0
+
+    if not pages:
+        print("  Nessuna pagina trovata")
+        return 0
+
+    print(f"  Pagine trovate: {len(pages)}")
+    purged = 0
+    for i in range(0, len(pages), PURGE_BATCH_SIZE):
+        batch = pages[i:i + PURGE_BATCH_SIZE]
+        try:
+            SITE.purgepages(batch, forcelinkupdate=True)
+            purged += len(batch)
+        except Exception as e:
+            print(f"  ERRORE purge batch {i // PURGE_BATCH_SIZE + 1}: {e}")
+
+    print(f"  OK Purgate {purged}/{len(pages)} pagine")
+    return purged
+
+
 def update_data_page(page_name, lua_code, part_num, total_parts):
     """Aggiorna singola pagina dati. In DRY_RUN non scrive."""
     if DRY_RUN:
@@ -3360,13 +3430,15 @@ def _fmt_elapsed(seconds):
 
 
 def main():
-    global DRY_RUN, DEBUG_MODE
+    global DRY_RUN, DEBUG_MODE, PURGE_ENABLED
 
-    # Supporto flag --dry-run e --debug da riga di comando
+    # Supporto flag --dry-run, --debug e --no-purge da riga di comando
     if '--dry-run' in sys.argv:
         DRY_RUN = True
     if '--debug' in sys.argv:
         DEBUG_MODE = True
+    if '--no-purge' in sys.argv:
+        PURGE_ENABLED = False
 
     tee = setup_log()
 
@@ -3662,6 +3734,12 @@ def main():
     _t_blank = datetime.now()
     blank_old_data_files(total_files)
     print(f"  [blank_old] Tempo: {_fmt_elapsed((datetime.now()-_t_blank).total_seconds())}")
+
+    if PURGE_ENABLED and successes > 0:
+        _t_purge = datetime.now()
+        purge_template_transclusions()
+        print(f"  [purge] Tempo: {_fmt_elapsed((datetime.now()-_t_purge).total_seconds())}")
+
     print(f"  [STEP 7] Tempo: {_fmt_elapsed((datetime.now()-_t7).total_seconds())}")
 
     # ----------------------------------------
