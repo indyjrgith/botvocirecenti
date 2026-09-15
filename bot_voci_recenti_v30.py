@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.10.0
+Bot VociRecenti v9.10.1
 
 Changelog:
+- v9.10.1: FIX: PURGE_BATCH_SIZE ridotto da 500 a 50 (coerente con
+        CLEANUP_BATCH_SIZE). Un batch da 500 pagine con forcelinkupdate=True
+        in un'unica chiamata action=purge puo' restare appeso per decine di
+        minuti lato server (rigenerazione sincrona di pagelinks per ogni
+        pagina), bloccando il job e mettendo in coda gli altri job schedulati.
 - v9.10.0: NUOVA FUNZIONALITA': purge con forcelinkupdate=True di tutte le
         pagine che trascludono Template:VociRecenti, eseguito a fine STEP 7
         subito dopo blank_old_data_files. Motivazione: la visualizzazione
@@ -12,8 +17,8 @@ Changelog:
         tabella pagelinks) restavano indietro finche' quel job non veniva
         processato dalla coda, con ritardi anche di ore. Nuova funzione
         purge_template_transclusions(): recupera le transclusioni con
-        Page.embeddedin(), le purga in batch da PURGE_BATCH_SIZE (500,
-        limite per bot flag di action=purge) - per le (anche) centinaia di
+        Page.embeddedin(), le purga in batch da PURGE_BATCH_SIZE (vedi
+        v9.10.1 per la revisione del valore) - per le (anche) centinaia di
         pagine attese (Utente:/Portale:/Progetto: e talk) restano 1-2
         chiamate API totali. Nessun filtro di namespace (tutte le
         transclusioni vanno purgate). Skip completo in DRY_RUN; disattivabile
@@ -436,7 +441,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.10.0'
+VERSION = '9.10.1'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -505,7 +510,7 @@ CACHE_PARSED_PAGE = 'Utente:BotVociRecenti/CacheParsed'
 # Disattivabile da riga di comando con --no-purge.
 PURGE_ENABLED       = True
 PURGE_TEMPLATE_NAME = 'Template:VociRecenti'
-PURGE_BATCH_SIZE    = 500   # max titoli per chiamata action=purge (bot flag)
+PURGE_BATCH_SIZE    = 50    # titoli per chiamata purge con forcelinkupdate (ridotto da 500: causava richieste troppo lunghe/bloccanti)
 # ========================================
 
 SITE = pywikibot.Site('it', 'wikipedia')
