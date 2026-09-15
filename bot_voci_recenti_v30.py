@@ -1,8 +1,21 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.10.5
+Bot VociRecenti v9.10.6
 
 Changelog:
+- v9.10.6: PERFORMANCE: run reale con PURGE_WORKERS=10 completato con successo
+        (617/617 pagine purgate, 0 errori/timeout) in 10m20s. Dati raccolti
+        mostrano pero' scaling sub-lineare (speedup reale 2.3x passando da 1
+        a 10 worker, non 10x: contesa lato server su forcelinkupdate), coerente
+        coi tempi per-pagina osservati (da ~2.3s isolata a ~10s media sotto
+        concorrenza). PURGE_WORKERS alzato a 15 (stima ~9 min) come compromesso
+        fra velocita' e margine di sicurezza verso il server, in attesa di
+        verificare sul campo. Nota per sviluppi futuri: se le transclusioni
+        di Template:VociRecenti dovessero crescere molto, valutare di NON
+        eseguire il purge forcelinkupdate ad ogni run ma solo periodicamente
+        (es. ogni 5 ore), con un meccanismo di gating temporale simile a
+        quello gia' usato altrove nel progetto per operazioni pesanti eseguite
+        una volta al giorno anziche' ad ogni esecuzione.
 - v9.10.5: PERFORMANCE: il purge pagina-per-pagina sequenziale (v9.10.4) era
         corretto (nessun blocco reale) ma lento: ~2.3s/pagina in media,
         ~24 minuti stimati per 617 pagine con 1 solo worker. Parallelizzato
@@ -488,7 +501,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.10.5'
+VERSION = '9.10.6'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -559,7 +572,7 @@ PURGE_ENABLED       = True
 PURGE_TEMPLATE_NAME = 'Template:VociRecenti'
 PURGE_BATCH_SIZE    = 30    # non piu' usato dal purge (ora pagina-per-pagina, vedi PURGE_PAGE_TIMEOUT), lasciato per compatibilita'/riferimento storico
 PURGE_PAGE_TIMEOUT  = 30    # secondi massimi di attesa per il purge di UNA singola pagina, prima di abbandonarla e passare alla successiva
-PURGE_WORKERS       = 10    # numero di pagine purgate in parallelo (era sequenziale/1 worker: troppo lento su liste lunghe)
+PURGE_WORKERS       = 15    # numero di pagine purgate in parallelo (era sequenziale/1 worker: troppo lento su liste lunghe; 10->15 dopo test reale su 617 pagine: 0 errori, margine per salire)
 # ========================================
 
 SITE = pywikibot.Site('it', 'wikipedia')
