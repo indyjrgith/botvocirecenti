@@ -1,8 +1,23 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.10.4
+Bot VociRecenti v9.10.5
 
 Changelog:
+- v9.10.5: PERFORMANCE: il purge pagina-per-pagina sequenziale (v9.10.4) era
+        corretto (nessun blocco reale) ma lento: ~2.3s/pagina in media,
+        ~24 minuti stimati per 617 pagine con 1 solo worker. Parallelizzato
+        con PURGE_WORKERS=10 worker concorrenti (ThreadPoolExecutor esterno),
+        stima ~2-3 minuti per 617 pagine mantenendo forcelinkupdate=True.
+        Ogni pagina mantiene il proprio timeout individuale PURGE_PAGE_TIMEOUT
+        (mini-executor interno per worker, come nella versione sequenziale),
+        quindi una pagina lenta/bloccata occupa al massimo 30s di UN worker
+        su 10, non l'intero run. Log dettagliato invariato, ma l'ordine di
+        stampa ora segue l'ordine di completamento (non l'ordine originale
+        delle pagine) essendo parallelo. Se in pratica questo carico
+        concorrente dovesse rivelarsi comunque troppo aggressivo verso il
+        server (o troppo lento), l'alternativa e' passare a purge semplice
+        (forcelinkupdate=False, aggiornamento pagelinks asincrono via job
+        queue, mai bloccante).
 - v9.10.4: DIAGNOSI/FIX: anche con il timeout per-batch (v9.10.3), il primo
         batch di 30 pagine andava sempre in timeout dopo 300s, confermando
         un blocco reale lato server su action=purge&forcelinkupdate=true
@@ -381,6 +396,7 @@ import sys
 import logging
 import calendar as _calendar
 import concurrent.futures
+import threading
 
 # ========================================
 # FUSO ORARIO ITALIANO - implementazione robusta senza dipendenze esterne
@@ -472,7 +488,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.10.4'
+VERSION = '9.10.5'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -543,6 +559,7 @@ PURGE_ENABLED       = True
 PURGE_TEMPLATE_NAME = 'Template:VociRecenti'
 PURGE_BATCH_SIZE    = 30    # non piu' usato dal purge (ora pagina-per-pagina, vedi PURGE_PAGE_TIMEOUT), lasciato per compatibilita'/riferimento storico
 PURGE_PAGE_TIMEOUT  = 30    # secondi massimi di attesa per il purge di UNA singola pagina, prima di abbandonarla e passare alla successiva
+PURGE_WORKERS       = 10    # numero di pagine purgate in parallelo (era sequenziale/1 worker: troppo lento su liste lunghe)
 # ========================================
 
 SITE = pywikibot.Site('it', 'wikipedia')
@@ -3404,11 +3421,13 @@ def purge_template_transclusions():
     (altrimenti resta ferma fino al passaggio della coda job refreshLinks,
     disallineando le liste ottenute via API — es. AWB "Links on page" —
     anche quando la visualizzazione diretta della pagina e' gia' aggiornata).
-    Il purge viene eseguito UNA PAGINA ALLA VOLTA (non piu' in batch), con
-    timeout PURGE_PAGE_TIMEOUT per pagina e log dettagliato di ogni singolo
-    esito, per individuare subito eventuali pagine che si bloccano lato
-    server. In DRY_RUN non esegue alcuna chiamata. Non blocca il run in
-    caso di errore.
+    Il purge viene eseguito in PARALLELO su PURGE_WORKERS pagine alla volta
+    (era una pagina alla volta: troppo lento su liste di centinaia di
+    pagine), con timeout PURGE_PAGE_TIMEOUT per singola pagina e log
+    dettagliato di ogni esito (l'ordine di stampa segue l'ordine di
+    completamento, non l'ordine originale delle pagine, essendo parallelo).
+    In DRY_RUN non esegue alcuna chiamata. Non blocca il run in caso di
+    errore.
     """
     print(f"\nPurge transclusioni {PURGE_TEMPLATE_NAME}...")
     if DRY_RUN:
@@ -3430,34 +3449,45 @@ def purge_template_transclusions():
     purged = 0
     failed_pages = []
     n_pages = len(pages)
-    # Executor dedicato al purge: ogni pagina viene purgata singolarmente in
-    # un thread e attesa al massimo PURGE_PAGE_TIMEOUT secondi. Se scade, la
-    # pagina viene abbandonata (il thread bloccato puo' continuare in
-    # background senza pero' fermare il resto del bot) e si passa alla
-    # successiva. Log dettagliato per ogni pagina per individuare subito
-    # eventuali pagine problematiche. L'executor NON viene chiuso in modo
-    # bloccante (wait=False), per non restare appeso a fine funzione in
-    # attesa di eventuali thread ancora pendenti.
-    _purge_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    try:
-        for idx, page in enumerate(pages, start=1):
-            _t_page = datetime.now()
-            future = _purge_executor.submit(page.purge, forcelinkupdate=True)
+    _lock = threading.Lock()
+
+    def _purge_one(idx, page):
+        nonlocal purged
+        _t_page = datetime.now()
+        # Mini-executor dedicato a QUESTA pagina: permette di applicare un
+        # timeout individuale (PURGE_PAGE_TIMEOUT) anche se la chiamata gira
+        # gia' dentro un worker del pool esterno. Se scade, il worker esterno
+        # si libera e passa alla pagina successiva; il thread bloccato su
+        # questa singola pagina puo' proseguire in background senza pero'
+        # fermare nessuno (shutdown con wait=False).
+        _inner_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            future = _inner_executor.submit(page.purge, forcelinkupdate=True)
             try:
                 future.result(timeout=PURGE_PAGE_TIMEOUT)
-                purged += 1
                 _elapsed_page = _fmt_elapsed((datetime.now() - _t_page).total_seconds())
+                with _lock:
+                    purged += 1
                 print(f"  [{idx}/{n_pages}] {page.title()} - OK ({_elapsed_page})")
             except concurrent.futures.TimeoutError:
                 _elapsed_page = _fmt_elapsed((datetime.now() - _t_page).total_seconds())
+                with _lock:
+                    failed_pages.append(page.title())
                 print(f"  [{idx}/{n_pages}] {page.title()} - ERRORE TIMEOUT (scaduto dopo {PURGE_PAGE_TIMEOUT}s, {_elapsed_page})")
-                failed_pages.append(page.title())
             except Exception as e:
                 _elapsed_page = _fmt_elapsed((datetime.now() - _t_page).total_seconds())
+                with _lock:
+                    failed_pages.append(page.title())
                 print(f"  [{idx}/{n_pages}] {page.title()} - ERRORE ({_elapsed_page}): {e}")
-                failed_pages.append(page.title())
-    finally:
-        _purge_executor.shutdown(wait=False)
+        finally:
+            _inner_executor.shutdown(wait=False)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=PURGE_WORKERS) as _outer_executor:
+        _outer_futures = [
+            _outer_executor.submit(_purge_one, idx, page)
+            for idx, page in enumerate(pages, start=1)
+        ]
+        concurrent.futures.wait(_outer_futures)
 
     print(f"  OK Purgate {purged}/{n_pages} pagine")
     if failed_pages:
