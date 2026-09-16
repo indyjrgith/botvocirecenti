@@ -1,8 +1,26 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.10.6
+Bot VociRecenti v9.11.0
 
 Changelog:
+- v9.11.0: NUOVA FUNZIONALITA': purge_template_transclusions() ora e'
+        indipendente dal numero di pagine trascluse. PURGE_WORKERS riportato
+        a 10 (valori piu' alti non riducono il tempo di elaborazione, vedi
+        nota v9.10.6). Introdotto PURGE_MAX_PER_RUN=500: se le pagine da
+        purgare superano questa soglia, ogni run del bot ne purga al
+        massimo 500, ripartendo dal punto raggiunto nel run precedente
+        (indice salvato in indicepurging.json, stessa cartella DATA_DIR
+        degli altri stati). Se il blocco di 500 arriva a fine lista, il
+        resto viene "riciclato" dall'inizio per completare il blocco,
+        cosi' la rotazione copre l'intera lista in piu' passaggi anche se
+        la lista cresce/si riduce nel frattempo. Se le pagine sono <= 500,
+        vengono purgate tutte ad ogni run come prima (nessuna rotazione).
+        L'indice avanza anche per le pagine in errore/timeout (altrimenti
+        una pagina bloccata fermerebbe per sempre l'avanzamento); non
+        viene aggiornato in DRY-RUN ne' in caso di errore nel recupero
+        delle transclusioni. Implementa la nota per sviluppi futuri
+        lasciata in v9.10.6, ma con purge parziale a rotazione anziche'
+        con gating temporale.
 - v9.10.6: PERFORMANCE: run reale con PURGE_WORKERS=10 completato con successo
         (617/617 pagine purgate, 0 errori/timeout) in 10m20s. Dati raccolti
         mostrano pero' scaling sub-lineare (speedup reale 2.3x passando da 1
@@ -501,7 +519,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.10.6'
+VERSION = '9.11.0'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -532,6 +550,7 @@ AutoCleanTimeEnd   = '05:00'
 DATA_DIR = os.environ.get('BOT_DATA_DIR', os.path.dirname(os.path.abspath(__file__)))
 CLEANUP_STATE_FILE = os.path.join(DATA_DIR, 'cleanup_state.json')
 MOVES_CACHE_FILE   = os.path.join(DATA_DIR, 'moves_cache.json')
+PURGE_INDEX_FILE   = os.path.join(DATA_DIR, 'indicepurging.json')
 MOVES_CACHE_MAX_AGE_DAYS = 30
 
 # File di log
@@ -572,7 +591,8 @@ PURGE_ENABLED       = True
 PURGE_TEMPLATE_NAME = 'Template:VociRecenti'
 PURGE_BATCH_SIZE    = 30    # non piu' usato dal purge (ora pagina-per-pagina, vedi PURGE_PAGE_TIMEOUT), lasciato per compatibilita'/riferimento storico
 PURGE_PAGE_TIMEOUT  = 30    # secondi massimi di attesa per il purge di UNA singola pagina, prima di abbandonarla e passare alla successiva
-PURGE_WORKERS       = 15    # numero di pagine purgate in parallelo (era sequenziale/1 worker: troppo lento su liste lunghe; 10->15 dopo test reale su 617 pagine: 0 errori, margine per salire)
+PURGE_WORKERS       = 10    # numero di pagine purgate in parallelo (valori piu' alti non riducono il tempo di elaborazione, vedi test reale su 617 pagine)
+PURGE_MAX_PER_RUN   = 500   # numero massimo di pagine purgate ad ogni passaggio del bot; oltre questa soglia il purge prosegue "a rotazione" sui passaggi successivi (vedi indicepurging.json / _load_purge_index)
 # ========================================
 
 SITE = pywikibot.Site('it', 'wikipedia')
@@ -665,6 +685,33 @@ def _save_cleanup_state(state):
             json.dump(state, f, indent=2)
     except Exception as e:
         print(f"  WARNING: impossibile salvare cleanup_state.json: {e}")
+
+
+def _load_purge_index():
+    """
+    Legge l'indice (0-based) di ripartenza del purge a rotazione da
+    indicepurging.json. Rappresenta la posizione, nella lista delle pagine
+    trascluse, subito successiva all'ultima pagina purgata nel run
+    precedente. Se il file non esiste o e' corrotto, si riparte da 0.
+    """
+    if not os.path.exists(PURGE_INDEX_FILE):
+        return {'last_index': 0}
+    try:
+        with open(PURGE_INDEX_FILE, 'r', encoding='utf-8') as f:
+            state = json.load(f)
+            if 'last_index' not in state:
+                return {'last_index': 0}
+            return state
+    except Exception:
+        return {'last_index': 0}
+
+
+def _save_purge_index(state):
+    try:
+        with open(PURGE_INDEX_FILE, 'w', encoding='utf-8') as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        print(f"  WARNING: impossibile salvare indicepurging.json: {e}")
 
 
 def should_run_cleanup():
@@ -3439,8 +3486,17 @@ def purge_template_transclusions():
     pagine), con timeout PURGE_PAGE_TIMEOUT per singola pagina e log
     dettagliato di ogni esito (l'ordine di stampa segue l'ordine di
     completamento, non l'ordine originale delle pagine, essendo parallelo).
-    In DRY_RUN non esegue alcuna chiamata. Non blocca il run in caso di
-    errore.
+
+    Se le pagine trovate sono piu' di PURGE_MAX_PER_RUN, il purge di QUESTO
+    run si limita a un blocco di al massimo PURGE_MAX_PER_RUN pagine,
+    ripartendo dalla pagina successiva a quella raggiunta nel run
+    precedente (indice salvato in indicepurging.json). Se il blocco arriva
+    a fine lista prima di raggiungere PURGE_MAX_PER_RUN pagine, si
+    "ricicla" dall'inizio della lista per completare il blocco (rotazione
+    continua sui run successivi). Se le pagine trovate sono <=
+    PURGE_MAX_PER_RUN, vengono purgate tutte ad ogni run e l'indice resta
+    a 0. In DRY_RUN non esegue alcuna chiamata e non aggiorna l'indice.
+    Non blocca il run in caso di errore.
     """
     print(f"\nPurge transclusioni {PURGE_TEMPLATE_NAME}...")
     if DRY_RUN:
@@ -3449,16 +3505,43 @@ def purge_template_transclusions():
 
     try:
         tmpl_page = pywikibot.Page(SITE, PURGE_TEMPLATE_NAME)
-        pages = list(tmpl_page.embeddedin(total=None))
+        all_pages = list(tmpl_page.embeddedin(total=None))
     except Exception as e:
         print(f"  ERRORE recupero transclusioni: {e}")
         return 0
 
-    if not pages:
+    if not all_pages:
         print("  Nessuna pagina trovata")
         return 0
 
-    print(f"  Pagine trovate: {len(pages)}")
+    n_total = len(all_pages)
+    print(f"  Pagine trovate: {n_total}")
+
+    if n_total <= PURGE_MAX_PER_RUN:
+        # Tutte le pagine rientrano in un run: nessuna rotazione necessaria.
+        pages = all_pages
+        next_index = 0
+    else:
+        state = _load_purge_index()
+        start = state.get('last_index', 0)
+        if start >= n_total:
+            # La lista si e' ristretta rispetto all'indice salvato: si
+            # riparte dall'inizio.
+            start = 0
+
+        pages = all_pages[start:start + PURGE_MAX_PER_RUN]
+        if len(pages) < PURGE_MAX_PER_RUN:
+            # Fine lista raggiunta prima di completare il blocco: si
+            # ricicla dall'inizio per arrivare a PURGE_MAX_PER_RUN pagine.
+            remaining = PURGE_MAX_PER_RUN - len(pages)
+            pages = pages + all_pages[0:remaining]
+            next_index = remaining
+        else:
+            next_index = start + PURGE_MAX_PER_RUN
+
+        print(f"  Purging a rotazione: indice {start} -> {next_index} "
+              f"({len(pages)} pagine su {n_total} totali)")
+
     purged = 0
     failed_pages = []
     n_pages = len(pages)
@@ -3507,6 +3590,13 @@ def purge_template_transclusions():
         print(f"  Pagine con errori/timeout ({len(failed_pages)}):")
         for _title in failed_pages:
             print(f"    - {_title}")
+
+    if n_total > PURGE_MAX_PER_RUN:
+        # Le pagine con errore/timeout vengono comunque considerate
+        # "processate" ai fini dell'avanzamento dell'indice: altrimenti una
+        # singola pagina bloccata impedirebbe per sempre di procedere oltre.
+        _save_purge_index({'last_index': next_index})
+
     return purged
 
 
