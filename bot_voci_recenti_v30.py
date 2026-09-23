@@ -1,8 +1,20 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.11.1
+Bot VociRecenti v9.11.2
 
 Changelog:
+- v9.11.2: FIX bug 'Litokol': la reason 'no_ns0' (scritta da
+        validate_ns_or_manual_page_batch quando, scansionando direttamente
+        NS118/NS2, la controparte NS0 di un titolo non esiste ancora) non
+        era inclusa tra le reason "banali" riattivabili in
+        get_moved_to_ns0_since_cutoff (v9.8.1). Risultato: se il titolo
+        veniva poi effettivamente spostato in NS0 poco dopo il controllo,
+        il rilevamento tramite log spostamenti trovava gia' una entry
+        moves_cache 'rejected'/'no_ns0' e la scartava silenziosamente,
+        bloccando la voce per sempre invece di riattivarla come gia'
+        avviene per not_exist/redirect/ns<N>. Aggiunta 'no_ns0' a
+        _banal_reasons: ora si riattiva quando arriva uno spostamento
+        piu' recente del rifiuto, stesso meccanismo di v9.8.1.
 - v9.11.1: FIX bug moves_cache bloccato su 'accepted' stantio per voci
         spostate da Bozza (NS!=0->NS0) quando il recupero/parsing di
         creation_ts o move_ts falliva in download_page_data_batch: i tre
@@ -533,7 +545,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.11.1'
+VERSION = '9.11.2'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -3261,7 +3273,15 @@ def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
                     # gia' disponibile qui, nessuna chiamata API aggiuntiva),
                     # il rifiuto e' obsoleto e va rivalutato invece di bloccare
                     # per sempre il titolo fino a scadenza naturale (30gg).
-                    _banal_reasons = {'not_exist', 'redirect'}
+                    # v9.11.2: 'no_ns0' (scritta da validate_ns_or_manual_page_batch
+                    # quando la controparte NS0 non esiste ancora al momento del
+                    # controllo) ha la stessa semantica "non ancora" di
+                    # not_exist/redirect/ns<N> ed era esclusa dalla riattivazione,
+                    # bloccando titoli spostati poco dopo il controllo (bug
+                    # 'Litokol': check NS118 alle 20:06 -> no_ns0, spostamento
+                    # reale alle 20:51 mai rilevato perche' la entry restava
+                    # 'rejected' definitiva).
+                    _banal_reasons = {'not_exist', 'redirect', 'no_ns0'}
                     _is_banal = bool(_reason) and (
                         _reason in _banal_reasons or re.match(r'^ns\d+$', _reason))
                     if _is_banal and move_ts_str > cached.get('processed_at', '0'):
