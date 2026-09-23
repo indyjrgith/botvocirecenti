@@ -1,8 +1,22 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.11.0
+Bot VociRecenti v9.11.1
 
 Changelog:
+- v9.11.1: FIX bug moves_cache bloccato su 'accepted' stantio per voci
+        spostate da Bozza (NS!=0->NS0) quando il recupero/parsing di
+        creation_ts o move_ts falliva in download_page_data_batch: i tre
+        punti skipped_error ora scrivono moves_cache con reason
+        'no_creation_ts'/'move_ts_parse_error'/'creation_ts_parse_error'
+        invece di lasciare l'entry 'accepted' scritta ottimisticamente da
+        get_moved_to_ns0_since_cutoff. Le tre nuove reason sono state
+        aggiunte a _stale_reasons in get_moved_to_ns0_since_cutoff cosi'
+        vengono ritentate ad ogni run (errori transitori) anziche' restare
+        bloccate come rifiuto definitivo fino a scadenza cache. FIX
+        collaterale: l'eccezione di _fetch_creation_ts_single ora viene
+        stampata anche su stdout (log principale via Tee), non solo su
+        pulizia_cache.log tramite _clog_only, per non perderla nel flusso
+        "nuove voci" dove il file handle della pulizia e' None.
 - v9.11.0: NUOVA FUNZIONALITA': purge_template_transclusions() ora e'
         indipendente dal numero di pagine trascluse. PURGE_WORKERS riportato
         a 10 (valori piu' alti non riducono il tempo di elaborazione, vedi
@@ -519,7 +533,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.11.0'
+VERSION = '9.11.1'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -1609,6 +1623,7 @@ def _cleanup_fetch_wikitext_for_titles(titles):
                 format='json',
             ).submit()
         except Exception as e:
+            print(f"  WARNING _fetch_creation_ts '{title}': {e}")
             _clog_only(f"  WARNING _fetch_creation_ts '{title}': {e}")
             return title, ''
         query_data = result.get('query', {})
@@ -2416,6 +2431,8 @@ def download_page_data_batch(titles, existing_titles, cutoff_date, moves_cache=N
 
         if not creation_ts:
             skipped_error.append((title, "timestamp creazione non disponibile"))
+            if moves_cache is not None:
+                moves_cache[title] = {'processed_at': now_str, 'result': 'rejected', 'reason': 'no_creation_ts'}
             continue
 
         timestamp = creation_ts  # gia' in formato IT da _batch_fetch_wikitext
@@ -2435,12 +2452,16 @@ def download_page_data_batch(titles, existing_titles, cutoff_date, moves_cache=N
                     ref_date = datetime.strptime(creation_ts, '%Y%m%d%H%M%S')
                 except Exception:
                     skipped_error.append((title, "move_ts non parsabile"))
+                    if moves_cache is not None:
+                        moves_cache[title] = {'processed_at': now_str, 'result': 'rejected', 'reason': 'move_ts_parse_error'}
                     continue
         else:
             try:
                 ref_date = datetime.strptime(creation_ts, '%Y%m%d%H%M%S')
             except Exception:
                 skipped_error.append((title, "creation_ts non parsabile"))
+                if moves_cache is not None:
+                    moves_cache[title] = {'processed_at': now_str, 'result': 'rejected', 'reason': 'creation_ts_parse_error'}
                 continue
 
         if ref_date < cutoff_date:
@@ -3219,6 +3240,14 @@ def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
                     'ns0_to_ns0',
                     'ns0_to_ns0_api_error',
                     'ns0_to_ns0_old',
+                    # v9.9.x: errori transitori nel recupero/parsing di creation_ts
+                    # e move_ts in download_page_data_batch (bug moves_cache
+                    # bloccato su 'accepted' stantio). Vanno ritentati ad ogni
+                    # run finche' non si risolvono, non bloccati fino a
+                    # scadenza cache.
+                    'no_creation_ts',
+                    'move_ts_parse_error',
+                    'creation_ts_parse_error',
                 }
                 _reason = cached.get('reason')
                 _skip_cached = _reason not in _stale_reasons
