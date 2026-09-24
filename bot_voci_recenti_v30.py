@@ -1,8 +1,29 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.11.2
+Bot VociRecenti v9.11.3
 
 Changelog:
+- v9.11.3: FIX bug '(543354) 2014 AN55': il filtro iniziale di
+        download_page_data_batch ("Filtra subito da moves_cache i rifiuti
+        certi") scartava QUALSIASI entry 'rejected' in cache a meno che il
+        titolo non fosse presente in move_timestamps (cioe' rilevato come
+        spostamento o come ricreazione dello stesso titolo NS0). Una
+        creazione ex novo in NS0 (non uno spostamento) dopo un rifiuto
+        'no_ns0' scritto da validate_ns_or_manual_page_batch (voce
+        precedentemente lavorata in una sandbox utente/bozza, poi cancellata
+        e ricreata direttamente in NS0) non popola mai move_timestamps,
+        quindi restava bloccata per sempre: stesso bug di v9.11.2 ('Litokol')
+        ma sul percorso "creazione diretta" (Fonte 1) invece che su quello
+        "spostamento" (Fonte 2), percorso non coperto dal fix precedente.
+        Le reason 'banali' (not_exist/redirect/no_ns0/ns<N>) sono state
+        centralizzate in BANAL_REJECT_REASONS/_is_banal_reject_reason()
+        (condivisa fra get_moved_to_ns0_since_cutoff e
+        download_page_data_batch) e il filtro di download_page_data_batch
+        ora le riammette sempre, indipendentemente da has_new_move: il
+        ricontrollo avviene comunque dal vivo subito dopo con prop=info,
+        quindi riammetterle qui non rischia falsi positivi (a differenza di
+        'too_old', che resta bloccante senza nuovo move_timestamp perche' la
+        voce esisteva gia' ed era solo vecchia, non uno stato provvisorio).
 - v9.11.2: FIX bug 'Litokol': la reason 'no_ns0' (scritta da
         validate_ns_or_manual_page_batch quando, scansionando direttamente
         NS118/NS2, la controparte NS0 di un titolo non esiste ancora) non
@@ -2262,6 +2283,24 @@ def _batch_fetch_wikitext(titles):
     return _cleanup_fetch_wikitext_for_titles(titles)
 
 
+# Reason di rifiuto "banali": derivano da uno stato non definitivo al momento
+# del controllo (pagina non ancora esistente / non ancora spostata in NS0 /
+# redirect / namespace sbagliato), non da un rifiuto strutturale. Possono
+# diventare obsolete appena la pagina cambia stato, quindi un titolo con una
+# di queste reason in moves_cache va sempre ririprovato quando si ripresenta
+# come candidato (v9.11.3), a differenza di reason "definitive" come
+# 'too_old' (la voce esisteva gia' ed era solo vecchia: nessun nuovo stato
+# puo' renderla di nuovo valida senza un nuovo evento, es. spostamento).
+# Condivisa fra get_moved_to_ns0_since_cutoff (percorso spostamenti) e
+# download_page_data_batch (percorso creazioni dirette).
+BANAL_REJECT_REASONS = {'not_exist', 'redirect', 'no_ns0'}
+
+
+def _is_banal_reject_reason(reason):
+    """True se `reason` e' una reason di rifiuto non definitiva (vedi BANAL_REJECT_REASONS)."""
+    return bool(reason) and (reason in BANAL_REJECT_REASONS or re.match(r'^ns\d+$', reason))
+
+
 def download_page_data_batch(titles, existing_titles, cutoff_date, moves_cache=None, move_timestamps=None, origin_timestamps=None):
     """
     Scarica i dati completi di una lista di titoli usando chiamate API batch.
@@ -2300,15 +2339,30 @@ def download_page_data_batch(titles, existing_titles, cutoff_date, moves_cache=N
     now_str = now_it().strftime('%Y%m%d%H%M%S')
     skipped_cached = 0
 
-    # Filtra subito da moves_cache i rifiuti certi (no new move)
+    # Filtra subito da moves_cache i rifiuti certi (no new move).
+    # v9.11.3: le reason "banali" (BANAL_REJECT_REASONS: not_exist/redirect/
+    # no_ns0/ns<N>) vengono sempre riammesse, anche senza un nuovo
+    # move_timestamp: derivano da uno stato non definitivo e il titolo,
+    # ripresentandosi qui come candidato (da RC diretto o da scansione
+    # NS2/118), e' gia' un segnale che qualcosa e' cambiato dal momento del
+    # rifiuto. Il ricontrollo avviene comunque dal vivo subito dopo con
+    # prop=info, quindi riammetterle qui non rischia falsi positivi. Bug
+    # '(543354) 2014 AN55': voce creata ex novo in NS0 dopo un rifiuto
+    # 'no_ns0' sulla sandbox utente restava bloccata per sempre perche' non
+    # e' uno spostamento (nessun move_timestamp associato). Le reason NON
+    # banali (es. 'too_old') restano bloccanti come prima senza nuovo move.
     filtered = []
     for title in unique_titles:
         if moves_cache is not None:
             cached = moves_cache.get(title)
             has_new_move = move_timestamps and title in move_timestamps
             if cached and cached.get('result') == 'rejected' and not has_new_move:
-                skipped_cached += 1
-                continue
+                if _is_banal_reject_reason(cached.get('reason')):
+                    print(f"    RIVALUTATA (era '{cached.get('reason')}' in cache, "
+                          f"nuovo controllo): {title}")
+                else:
+                    skipped_cached += 1
+                    continue
             elif cached and cached.get('result') == 'rejected' and has_new_move:
                 print(f"    RIVALUTATA (era too_old in cache, nuovo spostamento in NS0): {title}")
         filtered.append(title)
@@ -3281,9 +3335,11 @@ def get_moved_to_ns0_since_cutoff(existing_titles, cutoff_date, moves_cache):
                     # 'Litokol': check NS118 alle 20:06 -> no_ns0, spostamento
                     # reale alle 20:51 mai rilevato perche' la entry restava
                     # 'rejected' definitiva).
-                    _banal_reasons = {'not_exist', 'redirect', 'no_ns0'}
-                    _is_banal = bool(_reason) and (
-                        _reason in _banal_reasons or re.match(r'^ns\d+$', _reason))
+                    # v9.11.3: reason banali centralizzate in
+                    # BANAL_REJECT_REASONS/_is_banal_reject_reason(), condivise
+                    # con download_page_data_batch (stesso bug ma sul percorso
+                    # "creazione diretta": vedi bug '(543354) 2014 AN55').
+                    _is_banal = _is_banal_reject_reason(_reason)
                     if _is_banal and move_ts_str > cached.get('processed_at', '0'):
                         _skip_cached = False
                         reactivated_stale_reject += 1
