@@ -1,8 +1,32 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.11.3
+Bot VociRecenti v9.11.4
 
 Changelog:
+- v9.11.4: FIX categorie per le voci validate da validate_ns_or_manual_page_batch
+        (STEP 5 NS2/NS118 e aggiunte manuali da CacheMoved): il record riceveva
+        in 'categorie' il dizionario {'visible': [...], 'hidden': [...]}
+        restituito da _batch_fetch_categories invece della lista delle sole
+        categorie visibili; format_lua_row iterava le chiavi del dizionario e
+        scriveva in cache le categorie letterali {"visible","hidden"}, senza
+        categorie nascoste. Effetto: per un ciclo (fino alla correzione della
+        FASE 3 della pulizia) la voce non compariva negli elenchi con
+        AndCat/OrCat/HAndCat/HOrCat e compariva in quelli con NoCat/HNoCat/
+        ExclIfNotCat da cui doveva essere esclusa. Ora 'categorie' e
+        'categorie_nascoste' sono valorizzate separatamente, come in
+        download_page_data_batch.
+        FIX ramo "Aggiorna:" di read_cache_moved: le categorie venivano lette
+        con page.categories(), che restituisce visibili e nascoste insieme, e
+        finivano tutte in 'categorie' (il record nuovo non aveva neppure il
+        campo 'categorie_nascoste'). Ora le categorie di tutti i titoli
+        "Aggiorna:" sono lette con un'unica chiamata cumulativa a
+        _batch_fetch_categories e separate in visibili/nascoste.
+        Rete di sicurezza in format_lua_row: se 'categorie' arriva comunque
+        come dizionario {'visible','hidden'}, viene scomposto correttamente
+        invece di serializzarne le chiavi.
+        Documentazione: commento esplicativo sullo skip dei rifiuti diversi da
+        'too_old' in validate_ns_or_manual_page_batch (logica invariata) e
+        docstring di format_lua_data aggiornata allo schema a 7 campi.
 - v9.11.3: FIX bug '(543354) 2014 AN55': il filtro iniziale di
         download_page_data_batch ("Filtra subito da moves_cache i rifiuti
         certi") scartava QUALSIASI entry 'rejected' in cache a meno che il
@@ -566,7 +590,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.11.3'
+VERSION = '9.11.4'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -1437,8 +1461,17 @@ def format_lua_row(page):
     Il 7° campo categorie_nascoste e' sempre presente (lista vuota se assente).
     """
     cats = page.get('categorie', [])
-    cats_lua = "{" + ",".join(lua_str(c) for c in cats) + "}"
     hcats = page.get('categorie_nascoste', [])
+    # v9.11.4: rete di sicurezza. Se 'categorie' arriva come dizionario
+    # {'visible': [...], 'hidden': [...]} (formato di _batch_fetch_categories),
+    # lo si scompone invece di serializzarne le chiavi "visible"/"hidden".
+    if isinstance(cats, dict):
+        if not hcats:
+            hcats = cats.get('hidden', []) or []
+        cats = cats.get('visible', []) or []
+    if isinstance(hcats, dict):
+        hcats = hcats.get('hidden', []) or []
+    cats_lua = "{" + ",".join(lua_str(c) for c in cats) + "}"
     hcats_lua = "{" + ",".join(lua_str(c) for c in hcats) + "}"
     tmpl_list = []
     for t in page.get('templates', []):
@@ -1457,8 +1490,9 @@ def format_lua_row(page):
 def format_lua_data(pages_data, part_number, total_parts):
     """
     Formatta dati in Lua con formato compatto senza keyword ripetute per voce.
-    Schema array posizionale:
-      {titolo, timestamp, {categorie}, {{tmpl_nome,{params}}, ...}, preview, move_ts}
+    Schema array posizionale (7 campi, vedi format_lua_row):
+      {titolo, timestamp, {categorie_visibili}, {{tmpl_nome,{params}}, ...},
+       preview, move_ts, {categorie_nascoste}}
     """
     lines = []
     now_str = now_it().strftime('%Y-%m-%d %H:%M:%S')
@@ -2733,6 +2767,16 @@ def validate_ns_or_manual_page_batch(titles, existing_titles, cutoff_date, moves
             continue
 
         if moves_cache is not None:
+            # Nota (v9.11.4, logica invariata): i titoli con un rifiuto diverso
+            # da 'too_old' (in pratica quasi sempre 'no_ns0', scritto qui stesso
+            # per ogni sandbox/bozza senza controparte NS0) non vengono
+            # rivalidati da questo percorso: evita di interrogare a ogni run le
+            # migliaia di sandbox mai pubblicate. Non si perdono voci: quando la
+            # pagina arriva davvero in NS0 la recupera lo STEP 4b (Fonte 2 per
+            # gli spostamenti, Fonte 1 + download_page_data_batch per le
+            # creazioni dirette), che riattiva i rifiuti "banali". I titoli
+            # 'too_old' invece vengono ricontrollati (costo API, nessun dato
+            # errato).
             cached = moves_cache.get(ns0_title)
             if cached and cached.get('result') == 'rejected' and cached.get('reason') != 'too_old':
                 skip_reasons[title] = 'cached_rejected'
@@ -2803,7 +2847,10 @@ def validate_ns_or_manual_page_batch(titles, existing_titles, cutoff_date, moves
                 moves_cache[ns0_title] = {'processed_at': now_str, 'result': 'rejected', 'reason': 'too_old'}
             continue
 
-        categories = cats_by_title.get(ns0_title, [])
+        # v9.11.4: _batch_fetch_categories restituisce {'visible', 'hidden'}
+        cat_data = cats_by_title.get(ns0_title, {}) or {}
+        categories        = cat_data.get('visible', [])
+        categories_hidden = cat_data.get('hidden', [])
         templates = parse_templates_from_wikitext(wikitext)
         preview = wikitext[:100].replace("\n", " ").strip() if wikitext else ""
 
@@ -2814,6 +2861,7 @@ def validate_ns_or_manual_page_batch(titles, existing_titles, cutoff_date, moves
             'titolo': ns0_title,
             'timestamp': creation_ts,
             'categorie': categories,
+            'categorie_nascoste': categories_hidden,
             'templates': templates,
             'preview': preview
         }
@@ -2888,6 +2936,13 @@ def read_cache_moved(existing_titles, cutoff_date, cached_pages_by_title=None):
             print(f"  Rimuovi: {rt}")
 
         # Gestione Aggiorna: (ancora singola per voce - logica specifica)
+        # v9.11.4: due passate. Passata A (per voce): verifica esistenza/redirect,
+        # purge, wikitext. Passata B: categorie di tutte le voci valide con
+        # un'unica chiamata cumulativa a _batch_fetch_categories (eseguita DOPO
+        # i purge, come prima), separate in visibili/nascoste. In precedenza
+        # page.categories() restituiva visibili e nascoste insieme e finivano
+        # tutte in 'categorie'.
+        upd_valid = []   # [(title, page_obj, new_templates, new_preview)]
         for title in update_titles:
             print(f"  Aggiorna: {title}")
             try:
@@ -2902,19 +2957,33 @@ def read_cache_moved(existing_titles, cutoff_date, cached_pages_by_title=None):
                 except Exception:
                     pass
                 try:
-                    new_cats = [cat.title(with_ns=False) for cat in page_obj.categories()]
-                except Exception:
-                    new_cats = []
-                try:
                     wikitext = page_obj.text
                     new_templates = parse_templates_from_wikitext(wikitext)
                     new_preview = wikitext[:100].replace('\n', ' ').strip() if wikitext else ''
                 except Exception:
                     new_templates = []
                     new_preview = ''
+                upd_valid.append((title, page_obj, new_templates, new_preview))
+            except Exception as e:
+                print(f"    ERRORE Aggiorna {title}: {e}")
+
+        upd_cats = {}
+        if upd_valid:
+            try:
+                upd_cats = _batch_fetch_categories([t for t, _, _, _ in upd_valid])
+            except Exception as e:
+                print(f"    ERRORE lettura categorie (Aggiorna): {e}")
+                upd_cats = {}
+
+        for title, page_obj, new_templates, new_preview in upd_valid:
+            try:
+                cat_data = upd_cats.get(title, {}) or {}
+                new_cats        = cat_data.get('visible', [])
+                new_cats_hidden = cat_data.get('hidden', [])
                 if title in cached_pages_by_title:
                     record = dict(cached_pages_by_title[title])
                     record['categorie'] = new_cats
+                    record['categorie_nascoste'] = new_cats_hidden
                     record['templates'] = new_templates
                     record['preview'] = new_preview
                     pages_to_update.append(record)
@@ -2930,6 +2999,7 @@ def read_cache_moved(existing_titles, cutoff_date, cached_pages_by_title=None):
                         'titolo': title,
                         'timestamp': timestamp,
                         'categorie': new_cats,
+                        'categorie_nascoste': new_cats_hidden,
                         'templates': new_templates,
                         'preview': new_preview
                     }
