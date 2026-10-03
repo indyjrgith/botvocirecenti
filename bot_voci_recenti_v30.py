@@ -1,8 +1,51 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.11.4
+Bot VociRecenti v9.11.5
 
 Changelog:
+- v9.11.5: FIX categorie non aggiornate per voci con 'touched' invariato
+        (caso reale "Episodi di Another Self (terza stagione)"): la voce era
+        stata creata alle 10:23 UTC con le sole categorie nascoste; la
+        categoria visibile (generata da {{StagioniTV}}) e' stata registrata
+        da MediaWiki alle 21:46 UTC senza nuove revisioni ne' modifiche al
+        template, e senza che 'touched' facesse rileggere la voce al bot.
+        E' il "rischio noto e accettato" introdotto in v9.9.1 (fetch
+        categorie in FASE 3 solo per le voci con 'touched' cambiato): la
+        voce restava in cache senza categorie visibili e compariva negli
+        elenchi con NoCat=*.
+        Fix 1 (rilettura a rotazione): in FASE 3 le categorie vengono
+        rilette, oltre che per le voci con 'touched' cambiato, anche per una
+        quota delle voci con 'touched' invariato: quelle per cui
+        zlib.crc32(titolo) % CATEGORY_REFRESH_ROTATION coincide con lo slot
+        del giro corrente. Lo slot deriva da un contatore persistente
+        ('cat_refresh_counter' in cleanup_state.json), incrementato a ogni
+        pulizia. Ogni voce viene quindi riletta almeno una volta ogni
+        CATEGORY_REFRESH_ROTATION pulizie (con AutoClean='Every' e bot
+        orario: ore). crc32 e non hash(): hash() delle stringhe e'
+        randomizzato a ogni avvio di Python e la rotazione non sarebbe
+        stabile. CATEGORY_REFRESH_ROTATION=1 rilegge tutto a ogni giro
+        (comportamento pre-v9.9.1 per le sole categorie).
+        Per le voci rilette solo a rotazione vengono aggiornate SOLO
+        'categorie' e 'categorie_nascoste': template, anteprima e timestamp
+        restano quelli in cache (il wikitext non viene riletto). La
+        touched_cache non cambia.
+        Fix 2 (errori di rete): _cleanup_fetch_categories_batch_worker in
+        caso di eccezione (anche a meta' paginazione clcontinue) restituiva
+        liste vuote o parziali, prese per buone dal chiamante: la voce
+        perdeva le categorie e, aggiornata la touched_cache, non veniva piu'
+        riletta. Ora il worker segnala il batch come fallito;
+        _cleanup_fetch_categories_for_titles accetta il parametro opzionale
+        failed_out (set) in cui raccoglie i titoli dei batch falliti. In
+        FASE 3, per quei titoli si mantengono le categorie gia' in cache e
+        non si aggiorna la touched_cache, cosi' vengono riletti al giro
+        successivo. Gli altri punti di chiamata (download_page_data_batch,
+        validate_ns_or_manual_page_batch, read_cache_moved) non cambiano:
+        un record nuovo con categorie vuote per errore viene corretto dalla
+        FASE 3 del giro successivo, perche' non ha ancora una entry
+        '__touched__:' (o, se ne ha una vecchia, entro la rotazione).
+        Log: nuove righe "AGGIORNATA (categorie, touched invariato)" e
+        "CATEGORIE NON LETTE (errore API, riprova al prossimo giro)" in
+        pulizia_cache.log, e contatori nel riepilogo della FASE 3.
 - v9.11.4: FIX categorie per le voci validate da validate_ns_or_manual_page_batch
         (STEP 5 NS2/NS118 e aggiunte manuali da CacheMoved): il record riceveva
         in 'categorie' il dizionario {'visible': [...], 'hidden': [...]}
@@ -498,6 +541,7 @@ import sys
 import logging
 import calendar as _calendar
 import concurrent.futures
+import zlib
 import threading
 
 # ========================================
@@ -590,7 +634,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.11.4'
+VERSION = '9.11.5'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -637,6 +681,10 @@ CLEANUP_REMOVE_TOO_OLD     = True
 CLEANUP_BATCH_SIZE         = 50   # titoli per chiamata API (max MediaWiki)
 CLEANUP_BATCH_SIZE_REV     = 20   # titoli per chiamata revisions (wikitext puo' essere grande)
 REVISIONS_THREADS          = 8    # thread paralleli per CHIAMATA A (rvdir=newer, una per titolo)
+# v9.11.5: le categorie delle voci con 'touched' invariato vengono rilette a
+# rotazione: ogni voce almeno una volta ogni N pulizie (con AutoClean='Every'
+# e bot orario, N ore). 1 = rilettura completa a ogni giro.
+CATEGORY_REFRESH_ROTATION  = 6
 CLEANUP_LOG_FILE           = os.path.join(DATA_DIR, 'pulizia_cache.log')
 
 # Controllo voci cancellate/redirect ad ogni run del bot (STEP 3b)
@@ -1566,10 +1614,15 @@ def _cleanup_fetch_categories_batch_worker(batch, batch_index):
     (v9.9.1): ogni worker scrive solo nel proprio dizionario locale, che
     viene unito nel thread principale (nessun dato condiviso in scrittura
     concorrente).
-    Restituisce dict {titolo: {'visible': [...], 'hidden': [...]}} limitato
-    ai titoli del batch.
+    Restituisce la tupla (local_cats, failed):
+      local_cats: dict {titolo: {'visible': [...], 'hidden': [...]}} limitato
+                  ai titoli del batch;
+      failed:     True se una chiamata e' andata in errore (anche a meta'
+                  paginazione): in quel caso local_cats e' vuoto o parziale
+                  e NON va usato (v9.11.5).
     """
     local_cats = {t: {'visible': [], 'hidden': []} for t in batch}
+    failed = False
     norm_to_orig = {}
     params = {
         'action': 'query',
@@ -1584,6 +1637,7 @@ def _cleanup_fetch_categories_batch_worker(batch, batch_index):
             result = SITE.simple_request(**params).submit()
         except Exception as e:
             _clog_only(f"  WARNING _fetch_categories batch [{batch_index + 1}]: {e}")
+            failed = True
             break
         query_data = result.get('query', {})
         if not norm_to_orig:
@@ -1618,10 +1672,10 @@ def _cleanup_fetch_categories_batch_worker(batch, batch_index):
         else:
             break
 
-    return local_cats
+    return local_cats, failed
 
 
-def _cleanup_fetch_categories_for_titles(titles):
+def _cleanup_fetch_categories_for_titles(titles, failed_out=None):
     """
     Scarica le categorie complete per una lista di titoli tramite API batch.
     Suddivide in batch da CLEANUP_BATCH_SIZE titoli ed esegue i batch in
@@ -1634,6 +1688,9 @@ def _cleanup_fetch_categories_for_titles(titles):
     Restituisce dict {titolo: {'visible': [...], 'hidden': [...]}}.
     NON usa clshow=!hidden: le categorie delle disambigue sono nascoste e
     verrebbero silenziosamente scartate.
+    failed_out (v9.11.5): se e' un set, vi vengono aggiunti i titoli dei batch
+    andati in errore; per quei titoli il dizionario restituito contiene liste
+    vuote che il chiamante NON deve trattare come "nessuna categoria".
     """
     cats_by_title = {t: {'visible': [], 'hidden': []} for t in titles}
     if not titles:
@@ -1645,8 +1702,12 @@ def _cleanup_fetch_categories_for_titles(titles):
     with concurrent.futures.ThreadPoolExecutor(max_workers=REVISIONS_THREADS) as executor:
         futures = [executor.submit(_cleanup_fetch_categories_batch_worker, batch, idx)
                    for idx, batch in enumerate(batches)]
-        for future in futures:
-            local_cats = future.result()
+        for future, batch in zip(futures, batches):
+            local_cats, failed = future.result()
+            if failed:
+                if failed_out is not None:
+                    failed_out.update(batch)
+                continue
             cats_by_title.update(local_cats)
 
     return cats_by_title
@@ -1759,7 +1820,7 @@ def _cleanup_fetch_wikitext_for_titles(titles):
     return result_by_title
 
 
-def _cleanup_check_and_update_pages_batch(pages, moves_cache=None):
+def _cleanup_check_and_update_pages_batch(pages, moves_cache=None, rotation_slot=None):
     """
     Verifica e aggiorna i metadati di tutte le voci in cache tramite API batch.
     Tre passate:
@@ -1779,6 +1840,10 @@ def _cleanup_check_and_update_pages_batch(pages, moves_cache=None):
     dall'API (corregge corruzioni da doppia migrazione UTC->IT).
     moves_cache: se fornito, usato per leggere/scrivere touched_cache
                  (chiavi '__touched__:<titolo>').
+    rotation_slot (v9.11.5): slot di rotazione del giro corrente (0..N-1,
+                 N=CATEGORY_REFRESH_ROTATION). Le voci con touched invariato
+                 per cui crc32(titolo) % N == rotation_slot vengono rilette
+                 per le sole categorie. None = nessuna rilettura a rotazione.
     Restituisce (valid_pages, removed_count).
     """
     n = len(pages)
@@ -1854,9 +1919,26 @@ def _cleanup_check_and_update_pages_batch(pages, moves_cache=None):
         titles_need_rev = survivor_titles
         titles_skip_rev = []
 
-    print(f"  Recupero categorie per {len(titles_need_rev)} voci "
-          f"({len(titles_skip_rev)} saltate: touched invariato, v9.9.1)...")
-    cats_by_title = _cleanup_fetch_categories_for_titles(titles_need_rev)
+    # v9.11.5: rilettura categorie a rotazione per una quota delle voci con
+    # touched invariato (le categorie possono cambiare senza che touched cambi).
+    titles_rot_cats = []
+    if rotation_slot is not None and titles_skip_rev:
+        n_rot = max(1, CATEGORY_REFRESH_ROTATION)
+        titles_rot_cats = [t for t in titles_skip_rev
+                           if zlib.crc32(t.encode('utf-8')) % n_rot == rotation_slot]
+    titles_rot_cats_set = set(titles_rot_cats)
+
+    print(f"  Recupero categorie per {len(titles_need_rev) + len(titles_rot_cats)} voci "
+          f"({len(titles_need_rev)} con touched cambiato, {len(titles_rot_cats)} a rotazione "
+          f"slot {rotation_slot}/{CATEGORY_REFRESH_ROTATION}; "
+          f"{len(titles_skip_rev) - len(titles_rot_cats)} saltate)...")
+    cats_failed = set()
+    cats_by_title = _cleanup_fetch_categories_for_titles(titles_need_rev + titles_rot_cats,
+                                                         failed_out=cats_failed)
+    if cats_failed:
+        print(f"  ATTENZIONE: categorie non lette per {len(cats_failed)} voci (errore API): "
+              f"mantenute quelle in cache, riprova al prossimo giro")
+    rot_updated_count = 0
 
     print(f"  Recupero wikitext e timestamp creazione per {len(titles_need_rev)} voci "
           f"({CLEANUP_BATCH_SIZE_REV} titoli/chiamata)...")
@@ -1873,19 +1955,47 @@ def _cleanup_check_and_update_pages_batch(pages, moves_cache=None):
         if record is None:
             continue
 
+        norm_title = all_normalized.get(orig_title, orig_title)
+        cats_fetch_failed = orig_title in cats_failed or norm_title in cats_failed
+
         if orig_title in titles_skip_rev:
-            # Voce non modificata (touched invariato, v9.9.1): nessun fetch
-            # categorie eseguito, si mantiene il record cosi' com'e' in cache.
+            if orig_title not in titles_rot_cats_set or cats_fetch_failed:
+                # Voce non modificata (touched invariato, v9.9.1) e fuori dallo
+                # slot di rotazione (o fetch fallito, v9.11.5): si mantiene il
+                # record cosi' com'e' in cache.
+                if cats_fetch_failed:
+                    _clog_only(f"  CATEGORIE NON LETTE (errore API, riprova al prossimo giro): {orig_title}")
+                continue
+            # v9.11.5: rilettura a rotazione, si aggiornano SOLO le categorie.
+            if orig_title in cats_by_title:
+                cat_data = cats_by_title[orig_title]
+            else:
+                cat_data = cats_by_title.get(norm_title, {'visible': [], 'hidden': []})
+            rot_cats        = cat_data.get('visible', [])
+            rot_cats_hidden = cat_data.get('hidden', [])
+            if (set(rot_cats) != set(record.get('categorie', []))
+                    or set(rot_cats_hidden) != set(record.get('categorie_nascoste', []))):
+                updated = dict(record)
+                updated['categorie']          = rot_cats
+                updated['categorie_nascoste'] = rot_cats_hidden
+                updated_records[orig_title] = updated
+                rot_updated_count += 1
+                _clog_only(f"  AGGIORNATA (categorie, touched invariato): {orig_title}")
             continue
 
-        if orig_title in cats_by_title:
-            cat_data = cats_by_title[orig_title]
+        if cats_fetch_failed:
+            # v9.11.5: fetch categorie fallito, si mantengono quelle in cache
+            # (template/timestamp vengono comunque aggiornati sotto).
+            _clog_only(f"  CATEGORIE NON LETTE (errore API, riprova al prossimo giro): {orig_title}")
+            new_cats        = record.get('categorie', [])
+            new_cats_hidden = record.get('categorie_nascoste', [])
         else:
-            norm_title = all_normalized.get(orig_title, orig_title)
-            cat_data = cats_by_title.get(norm_title, {'visible': [], 'hidden': []})
-
-        new_cats        = cat_data.get('visible', [])
-        new_cats_hidden = cat_data.get('hidden', [])
+            if orig_title in cats_by_title:
+                cat_data = cats_by_title[orig_title]
+            else:
+                cat_data = cats_by_title.get(norm_title, {'visible': [], 'hidden': []})
+            new_cats        = cat_data.get('visible', [])
+            new_cats_hidden = cat_data.get('hidden', [])
 
         # Voce modificata o non ancora in touched_cache: percorso completo
         rev_data = rev_by_title.get(orig_title, {})
@@ -1926,8 +2036,9 @@ def _cleanup_check_and_update_pages_batch(pages, moves_cache=None):
                 changes.append('template')
             _clog_only(f"  AGGIORNATA ({', '.join(changes)}): {orig_title}")
 
-        # Aggiorna touched_cache per questa voce
-        if moves_cache is not None:
+        # Aggiorna touched_cache per questa voce (non se il fetch categorie e'
+        # fallito: la voce deve essere riletta al prossimo giro, v9.11.5)
+        if moves_cache is not None and not cats_fetch_failed:
             touched_now = touched_by_title.get(orig_title, '')
             if touched_now:
                 moves_cache[f'__touched__:{orig_title}'] = {'touched': touched_now}
@@ -1948,7 +2059,9 @@ def _cleanup_check_and_update_pages_batch(pages, moves_cache=None):
         valid_pages.append(updated_records.get(title, page))
 
     print(f"\nRisultato: {removed_count} voci rimosse, {len(updated_records)} voci aggiornate"
-          f" (di cui {ts_fixed_count} timestamp corretti)")
+          f" (di cui {ts_fixed_count} timestamp corretti, "
+          f"{rot_updated_count} categorie aggiornate a rotazione con touched invariato, "
+          f"{len(cats_failed)} categorie non lette per errore API)")
     return valid_pages, removed_count
 
 
@@ -2218,7 +2331,18 @@ def run_cleanup_internal(cached_pages, cache_files_count, moves_cache=None):
     print("\n" + "=" * 60)
     print("FASE 3: RIMOZIONE VOCI CANCELLATE / AGGIORNAMENTO METADATI")
     print("=" * 60)
-    cached_pages, removed_deleted = _cleanup_check_and_update_pages_batch(cached_pages, moves_cache=moves_cache)
+    # v9.11.5: slot di rotazione per la rilettura delle categorie
+    _cstate = _load_cleanup_state()
+    try:
+        _rot_counter = int(_cstate.get('cat_refresh_counter', 0))
+    except (TypeError, ValueError):
+        _rot_counter = 0
+    _rot_slot = _rot_counter % max(1, CATEGORY_REFRESH_ROTATION)
+    cached_pages, removed_deleted = _cleanup_check_and_update_pages_batch(
+        cached_pages, moves_cache=moves_cache, rotation_slot=_rot_slot)
+    _cstate = _load_cleanup_state()  # riletto: should_run_cleanup puo' averlo scritto
+    _cstate['cat_refresh_counter'] = _rot_counter + 1
+    _save_cleanup_state(_cstate)
 
     print("\n" + "=" * 60)
     print("FASE 4: RIMOZIONE VOCI TROPPO VECCHIE")
