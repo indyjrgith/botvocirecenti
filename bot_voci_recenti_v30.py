@@ -1,8 +1,32 @@
 #!/usr/bin/env python3
 """
-Bot VociRecenti v9.11.5
+Bot VociRecenti v9.11.6
 
 Changelog:
+- v9.11.6: FIX categorie visibili nella pagina ma assenti dall'API (caso reale
+        "Fenerbahce Spor Kulubu 2025-2026 (pallavolo maschile)"): la voce,
+        senza parametri sport/squadra in {{Stagione squadra}}, ha ricevuto le
+        categorie visibili da Wikidata; MediaWiki ha aggiornato la parser
+        cache (pagina visualizzata corretta, 'touched' cambiato) ma non la
+        tabella categorylinks, rimasta ferma alle sole categorie nascoste
+        della creazione finche' non e' stata fatta una modifica nulla.
+        prop=categories legge categorylinks, quindi il bot (anche con la
+        rotazione v9.11.5) rileggeva sempre lo stesso dato vecchio e la voce
+        compariva negli elenchi con NoCat=*.
+        Fix: in _cleanup_fetch_categories_for_titles, per ogni voce letta
+        correttamente da prop=categories ma con ZERO categorie visibili, le
+        categorie vengono richieste anche al parser con action=parse&
+        prop=categories (per pageid, una chiamata per voce: l'API non ha un
+        equivalente batch). Se il parser restituisce categorie diverse, si
+        usano le sue (visibili e nascoste). Essendo dentro la funzione
+        comune, il controllo vale per FASE 3, download_page_data_batch,
+        validate_ns_or_manual_page_batch e read_cache_moved.
+        Chiamate in parallelo (REVISIONS_THREADS) con timeout per voce
+        PARSE_PAGE_TIMEOUT; in caso di errore o timeout si mantiene il
+        risultato di prop=categories. Nomi categoria normalizzati
+        (underscore -> spazi); gestite formatversion 1 e 2.
+        Log: riga "CATEGORIE DA PARSER (categorylinks non aggiornata)" per
+        voce e riepilogo "Controllo parser: ..." a ogni esecuzione.
 - v9.11.5: FIX categorie non aggiornate per voci con 'touched' invariato
         (caso reale "Episodi di Another Self (terza stagione)"): la voce era
         stata creata alle 10:23 UTC con le sole categorie nascoste; la
@@ -634,7 +658,7 @@ DATA_PAGE_PREFIX = 'Modulo:VociRecenti/Dati'
 NAMESPACE = 0
 MAX_ITERATIONS = 100
 TIMEOUT = 300
-VERSION = '9.11.5'
+VERSION = '9.11.6'
 MAX_AGE_DAYS = 30
 config.put_throttle = 1
 config.minthrottle = 0
@@ -685,6 +709,9 @@ REVISIONS_THREADS          = 8    # thread paralleli per CHIAMATA A (rvdir=newer
 # rotazione: ogni voce almeno una volta ogni N pulizie (con AutoClean='Every'
 # e bot orario, N ore). 1 = rilettura completa a ogni giro.
 CATEGORY_REFRESH_ROTATION  = 6
+# v9.11.6: timeout (secondi) per la singola chiamata action=parse usata per le
+# voci senza categorie visibili in categorylinks.
+PARSE_PAGE_TIMEOUT         = 30
 CLEANUP_LOG_FILE           = os.path.join(DATA_DIR, 'pulizia_cache.log')
 
 # Controllo voci cancellate/redirect ad ogni run del bot (STEP 3b)
@@ -1619,9 +1646,11 @@ def _cleanup_fetch_categories_batch_worker(batch, batch_index):
                   ai titoli del batch;
       failed:     True se una chiamata e' andata in errore (anche a meta'
                   paginazione): in quel caso local_cats e' vuoto o parziale
-                  e NON va usato (v9.11.5).
+                  e NON va usato (v9.11.5);
+      local_pageids: dict {titolo: pageid} (v9.11.6, per action=parse).
     """
     local_cats = {t: {'visible': [], 'hidden': []} for t in batch}
+    local_pageids = {}
     failed = False
     norm_to_orig = {}
     params = {
@@ -1651,6 +1680,7 @@ def _cleanup_fetch_categories_batch_worker(batch, batch_index):
             key = orig if orig in local_cats else title_norm
             if key not in local_cats:
                 continue
+            local_pageids[key] = page_id
             for cat in page_info.get('categories', []):
                 cat_title = cat.get('title', '')
                 if ':' in cat_title:
@@ -1672,7 +1702,7 @@ def _cleanup_fetch_categories_batch_worker(batch, batch_index):
         else:
             break
 
-    return local_cats, failed
+    return local_cats, failed, local_pageids
 
 
 def _cleanup_fetch_categories_for_titles(titles, failed_out=None):
@@ -1693,6 +1723,8 @@ def _cleanup_fetch_categories_for_titles(titles, failed_out=None):
     vuote che il chiamante NON deve trattare come "nessuna categoria".
     """
     cats_by_title = {t: {'visible': [], 'hidden': []} for t in titles}
+    pageids = {}
+    batch_failed = set()
     if not titles:
         return cats_by_title
 
@@ -1703,14 +1735,102 @@ def _cleanup_fetch_categories_for_titles(titles, failed_out=None):
         futures = [executor.submit(_cleanup_fetch_categories_batch_worker, batch, idx)
                    for idx, batch in enumerate(batches)]
         for future, batch in zip(futures, batches):
-            local_cats, failed = future.result()
+            local_cats, failed, local_pageids = future.result()
             if failed:
+                batch_failed.update(batch)
                 if failed_out is not None:
                     failed_out.update(batch)
                 continue
             cats_by_title.update(local_cats)
+            pageids.update(local_pageids)
+
+    # v9.11.6: voci lette correttamente ma senza categorie visibili in
+    # categorylinks -> controllo sulla pagina visualizzata (action=parse).
+    to_parse = [t for t in titles
+                if t not in batch_failed and t in pageids
+                and not cats_by_title.get(t, {}).get('visible')]
+    if to_parse:
+        _parse_check_zero_visible(to_parse, pageids, cats_by_title)
 
     return cats_by_title
+
+
+def _parse_fetch_categories(pageid):
+    """
+    v9.11.6: categorie della pagina visualizzata (parser output) tramite
+    action=parse&prop=categories. Restituisce {'visible': [...], 'hidden': [...]}
+    con nomi senza prefisso e con spazi al posto degli underscore.
+    Solleva eccezione in caso di errore.
+    """
+    result = SITE.simple_request(
+        action='parse',
+        pageid=str(pageid),
+        prop='categories',
+        formatversion='2',
+        format='json',
+    ).submit()
+    parse_data = result.get('parse')
+    if not isinstance(parse_data, dict):
+        raise ValueError(f"risposta parse senza dati: {str(result)[:200]}")
+    cats = {'visible': [], 'hidden': []}
+    for cat in parse_data.get('categories', []):
+        # formatversion=2: 'category' + hidden true/false;
+        # formatversion=1: '*' + chiave 'hidden' presente se nascosta.
+        name = cat.get('category', cat.get('*', ''))
+        name = name.replace('_', ' ').strip()
+        if not name:
+            continue
+        hidden_val = cat.get('hidden', False)
+        is_hidden = hidden_val is True or hidden_val == ''
+        bucket = 'hidden' if is_hidden else 'visible'
+        if name not in cats[bucket]:
+            cats[bucket].append(name)
+    return cats
+
+
+def _parse_check_zero_visible(titles, pageids, cats_by_title):
+    """
+    v9.11.6: per le voci senza categorie visibili in categorylinks chiede le
+    categorie al parser (una chiamata per voce, in parallelo, con timeout
+    PARSE_PAGE_TIMEOUT). Se differiscono da quelle di categorylinks, aggiorna
+    cats_by_title in-place con quelle del parser. In caso di errore o timeout
+    lascia invariato il risultato di prop=categories.
+    """
+    lock = threading.Lock()
+    stats = {'changed': 0, 'failed': 0}
+
+    def _one(title):
+        inner = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            fut = inner.submit(_parse_fetch_categories, pageids[title])
+            try:
+                parsed = fut.result(timeout=PARSE_PAGE_TIMEOUT)
+            except concurrent.futures.TimeoutError:
+                _clog_only(f"  WARNING parse timeout ({PARSE_PAGE_TIMEOUT}s): {title}")
+                with lock:
+                    stats['failed'] += 1
+                return
+            except Exception as e:
+                _clog_only(f"  WARNING parse errore: {title}: {e}")
+                with lock:
+                    stats['failed'] += 1
+                return
+        finally:
+            inner.shutdown(wait=False)
+        old = cats_by_title.get(title, {'visible': [], 'hidden': []})
+        if (set(parsed['visible']) != set(old.get('visible', []))
+                or set(parsed['hidden']) != set(old.get('hidden', []))):
+            with lock:
+                cats_by_title[title] = parsed
+                stats['changed'] += 1
+            _clog(f"  CATEGORIE DA PARSER (categorylinks non aggiornata): {title} "
+                  f"-> {len(parsed['visible'])} visibili, {len(parsed['hidden'])} nascoste")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=REVISIONS_THREADS) as executor:
+        list(executor.map(_one, titles))
+
+    print(f"  Controllo parser: {len(titles)} voci senza categorie visibili in categorylinks, "
+          f"{stats['changed']} con categorie diverse nella pagina, {stats['failed']} errori")
 
 
 def _cleanup_fetch_wikitext_for_titles(titles):
