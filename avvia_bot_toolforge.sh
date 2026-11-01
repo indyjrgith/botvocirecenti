@@ -8,6 +8,16 @@
 #   ./avvia_bot_toolforge.sh [script.py] 2h15m            -> ogni 2 ore, al minuto 15
 #   ./avvia_bot_toolforge.sh [script.py] stop             -> ferma il bot in modo sicuro
 #   ./avvia_bot_toolforge.sh [script.py] logs             -> monitora i log in tempo reale
+#   ./avvia_bot_toolforge.sh [script.py] dry              -> lancia subito un one-off con --dry-run
+#                                                            (nessuna scrittura su Wikipedia)
+#
+# ESECUZIONE DA NFS: i job eseguono lo script dalla cartella in cui si
+# trova questo launcher (BOT_DIR, es. /data/project/botvocirecenti/
+# botvocirecenti), con percorso assoluto. L'immagine del build service
+# fornisce solo l'ambiente Python (pywikibot e dipendenze): per
+# deployare una nuova versione di uno script basta 'git pull' in
+# BOT_DIR, senza rebuild. Il rebuild serve solo se cambia
+# requirements.txt. Dopo un deploy conviene un controllo con 'dry'.
 #
 # Se [script.py] viene omesso, si usa bot_voci_recenti_v30.py per
 # retrocompatibilita' (comportamento storico di questo script).
@@ -17,6 +27,7 @@
 #   ./avvia_bot_toolforge.sh ArchiviaVociRecenti.py 0h30m   -> secondo bot, ogni ora al minuto 30
 #   ./avvia_bot_toolforge.sh ArchiviaVociRecenti.py stop    -> ferma solo ArchiviaVociRecenti.py
 #   ./avvia_bot_toolforge.sh stop                           -> ferma bot_voci_recenti_v30.py (default)
+#   ./avvia_bot_toolforge.sh ArchiviaVociRecenti.py dry     -> test a vuoto dopo un deploy
 
 # ============================================================
 # CONFIGURAZIONE
@@ -28,6 +39,9 @@ WIKI_API="https://it.wikipedia.org/w/api.php"
 SAFE_STOP_THRESHOLD=300   # secondi: se Dati1 è stato modificato meno di 5 minuti fa, il bot sta scrivendo
 SAFE_STOP_POLL=30         # secondi: intervallo di controllo
 GENERIC_SAFE_STOP_MAX_WAIT=1200   # secondi: tetto di attesa per il controllo generico, oltre il quale si chiede conferma manuale
+# Cartella degli script su NFS: quella in cui si trova questo launcher
+# (percorso fisico, symlink risolti). I job eseguono gli script da qui.
+BOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # ============================================================
 
 # Colori
@@ -67,24 +81,58 @@ oneoff_name_for_script() {
 }
 
 # ------------------------------------------------------------
+# Funzione: verifica che lo script esista in BOT_DIR prima di creare
+# un job, per evitare job che falliscono a ogni esecuzione.
+# ------------------------------------------------------------
+check_script_exists() {
+    if [ ! -f "${BOT_DIR}/${BOT_SCRIPT}" ]; then
+        echo -e "${RED}ERRORE: script non trovato: ${BOT_DIR}/${BOT_SCRIPT}${NC}"
+        echo -e "  Controlla il nome del file o esegui prima 'git pull' in ${BOT_DIR}."
+        exit 1
+    fi
+    if [[ "$BOT_DIR" == *" "* ]]; then
+        echo -e "${RED}ERRORE: il percorso '${BOT_DIR}' contiene spazi, non utilizzabile nel comando del job.${NC}"
+        exit 1
+    fi
+}
+
+# ------------------------------------------------------------
+# Funzione: comando del job (percorso assoluto su NFS)
+# Argomenti opzionali: parametri aggiuntivi per lo script
+# ------------------------------------------------------------
+job_command() {
+    local cmd="python3 ${BOT_DIR}/${BOT_SCRIPT}"
+    [ $# -gt 0 ] && cmd="$cmd $*"
+    echo "$cmd"
+}
+
+# ------------------------------------------------------------
 # Funzione: lancia il bot una volta sola
+# Argomenti: $1=nome del job one-off, $2...=parametri aggiuntivi
+# per lo script (es. --dry-run)
 # ------------------------------------------------------------
 launch_bot() {
+    local oneoff_name="$1"
+    shift
+    local cmd
+    cmd="$(job_command "$@")"
+
     echo -e "${CYAN}Avvio bot (esecuzione singola)...${NC}"
+    echo -e "  Comando: ${YELLOW}${cmd}${NC}"
 
-    # Rimuovi eventuale job one-off precedente
-    toolforge jobs delete "$JOB_NAME_ONEOFF" 2>/dev/null
+    # Rimuovi eventuale job one-off precedente con lo stesso nome
+    toolforge jobs delete "$oneoff_name" 2>/dev/null
 
-    toolforge jobs run "$JOB_NAME_ONEOFF" \
-        --command "python3 $BOT_SCRIPT" \
+    toolforge jobs run "$oneoff_name" \
+        --command "$cmd" \
         --image "$BOT_IMAGE" \
         --mount all \
         --filelog
 
-    echo -e "${GREEN}Bot avviato come job one-off '${JOB_NAME_ONEOFF}'.${NC}"
-    echo -e "  Stato:  ${YELLOW}toolforge jobs show ${JOB_NAME_ONEOFF}${NC}"
-    echo -e "  Log:    ${YELLOW}tail -f ~/${JOB_NAME_ONEOFF}.out${NC}"
-    echo -e "  Ferma:  ${YELLOW}toolforge jobs delete ${JOB_NAME_ONEOFF}${NC}"
+    echo -e "${GREEN}Bot avviato come job one-off '${oneoff_name}'.${NC}"
+    echo -e "  Stato:  ${YELLOW}toolforge jobs show ${oneoff_name}${NC}"
+    echo -e "  Log:    ${YELLOW}tail -f ~/${oneoff_name}.out${NC}"
+    echo -e "  Ferma:  ${YELLOW}toolforge jobs delete ${oneoff_name}${NC}"
 }
 
 # ------------------------------------------------------------
@@ -105,8 +153,15 @@ install_schedule() {
     echo -e "${CYAN}Configurazione job schedulato per ${BOT_SCRIPT}...${NC}"
     echo -e "  Espressione cron: ${YELLOW}${cron_expr}${NC}"
 
-    # Rimuovi job schedulato esistente
+    local cmd
+    cmd="$(job_command)"
+    echo -e "  Comando:          ${YELLOW}${cmd}${NC}"
+
+    # Rimuovi job schedulato esistente, attendendo prima che non sia
+    # in esecuzione (la cancellazione interromperebbe un salvataggio
+    # a meta')
     if toolforge jobs show "$JOB_NAME" &>/dev/null; then
+        wait_for_safe_stop
         echo -e "  Rimozione job esistente '${JOB_NAME}'..."
         toolforge jobs delete "$JOB_NAME"
         sleep 2
@@ -114,7 +169,7 @@ install_schedule() {
 
     # Crea nuovo job schedulato
     toolforge jobs run "$JOB_NAME" \
-        --command "python3 $BOT_SCRIPT" \
+        --command "$cmd" \
         --image "$BOT_IMAGE" \
         --mount all \
         --filelog \
@@ -304,6 +359,12 @@ stop_schedule() {
         echo -e "${GREEN}Job one-off '${JOB_NAME_ONEOFF}' eliminato.${NC}"
     fi
 
+    # Elimina anche eventuale job di test dry-run
+    if toolforge jobs show "$JOB_NAME_DRY" &>/dev/null; then
+        toolforge jobs delete "$JOB_NAME_DRY"
+        echo -e "${GREEN}Job di test '${JOB_NAME_DRY}' eliminato.${NC}"
+    fi
+
     echo -e "${GREEN}Bot fermato.${NC}"
 }
 
@@ -339,8 +400,8 @@ parse_param() {
     fi
 
     echo -e "${RED}ERRORE: formato non riconosciuto '${param}'.${NC}"
-    echo -e "  Uso: ${YELLOW}./avvia_bot_toolforge.sh [Nm | XhYm | stop]${NC}"
-    echo -e "  Esempi: 2m  |  0h15m  |  2h30m  |  stop"
+    echo -e "  Uso: ${YELLOW}./avvia_bot_toolforge.sh [script.py] [Nm | XhYm | stop | logs | dry]${NC}"
+    echo -e "  Esempi: 2m  |  0h15m  |  2h30m  |  stop  |  logs  |  dry"
     exit 1
 }
 
@@ -358,6 +419,7 @@ fi
 
 JOB_NAME="$(job_name_for_script "$BOT_SCRIPT")"
 JOB_NAME_ONEOFF="$(oneoff_name_for_script "$BOT_SCRIPT")"
+JOB_NAME_DRY="${JOB_NAME_ONEOFF}-dry"
 
 # --- logs: mostra i log in tempo reale ---
 if [ "$1" = "logs" ]; then
@@ -382,6 +444,17 @@ if [ "$1" = "stop" ]; then
     exit 0
 fi
 
+# --- dry: one-off di test con --dry-run (nessuna scrittura su Wikipedia) ---
+if [ "$1" = "dry" ]; then
+    echo -e "${CYAN}=== Bot ${BOT_SCRIPT} — Test dry-run ===${NC}"
+    check_script_exists
+    launch_bot "$JOB_NAME_DRY" --dry-run
+    exit 0
+fi
+
+# Da qui in poi si crea un job (one-off o schedulato): lo script deve esistere
+check_script_exists
+
 # --- Nessun parametro rimanente: lancio immediato ---
 if [ $# -eq 0 ]; then
     echo -e "${CYAN}=== Bot ${BOT_SCRIPT} ===${NC}"
@@ -390,7 +463,7 @@ if [ $# -eq 0 ]; then
     read -r risposta
     case "$risposta" in
         [sS]|[yY])
-            launch_bot
+            launch_bot "$JOB_NAME_ONEOFF"
             ;;
         *)
             echo "Annullato."
