@@ -174,6 +174,18 @@ Changelog:
         riordinate. Il ramo "nuova sezione" (nessun marcatore
         combaciante in archivio) resta invariato: le righe arrivano
         gia' ordinate dal modulo Lua per quell'istanza.
+- v1.3.4: Fix: split_top_level (usata da parse_params) contava come
+        annidamento anche le graffe/quadre SINGOLE. Un valore come
+        TextRegExp=%{Oggetto non stellare apriva un livello mai chiuso e
+        tutti i parametri successivi dell'istanza (es. DispScroll)
+        finivano dentro quel valore: disp tornava al default 's', il
+        riordino non era applicabile e la sezione veniva solo accodata,
+        con ordinamento misto in archivio. Ora conta solo le coppie
+        '{{'/'}}' e '[['/']]' (coerente con find_balanced_template_end e
+        con MediaWiki) e il livello non scende sotto zero. Il fix vale
+        anche per i parametri di {{ArchiviaVociRecenti}}. Le sezioni gia'
+        archiviate in disordine vengono riordinate automaticamente alla
+        successiva archiviazione (merge_existing_section).
 """
 
 import pywikibot
@@ -266,7 +278,7 @@ SAVE_CONFLICT_RETRIES = 2
 # l'altro bot del progetto.
 CLEANUP_API_CHUNK_SIZE = 50
 
-VERSION = '1.3.3'
+VERSION = '1.3.4'
 
 config.put_throttle = 1
 config.minthrottle = 0
@@ -476,22 +488,43 @@ def find_all_template_spans(text, template_name):
 
 def split_top_level(s, sep):
     """Divide s in base a sep, ignorando i separatori annidati dentro
-    {{...}} o [[...]]."""
+    {{...}} o [[...]].
+
+    Come find_balanced_template_end, conta esclusivamente le COPPIE
+    doppie '{{'/'}}' e '[['/']]' (i veri delimitatori per MediaWiki), non
+    le singole graffe/quadre isolate: un valore di parametro che contiene
+    una '{' o ']' solitaria (es. una regexp con '%{...') e' testo
+    letterale per il parser del wiki e non deve alterare il livello di
+    annidamento, altrimenti tutti i separatori successivi verrebbero
+    ignorati e i parametri seguenti "inghiottiti" nel valore precedente.
+    Le triple '{{{...}}}' restano bilanciate (coppia + graffa singola
+    ignorata). Il livello non scende mai sotto zero, cosi' una chiusura
+    orfana non blocca gli split successivi.
+    """
     parts = []
     depth = 0
     current = []
-    for c in s:
-        if c in '{[':
+    i = 0
+    n = len(s)
+    while i < n:
+        pair = s[i:i + 2]
+        if pair in ('{{', '[['):
             depth += 1
-            current.append(c)
-        elif c in '}]':
-            depth -= 1
-            current.append(c)
-        elif c == sep and depth == 0:
+            current.append(pair)
+            i += 2
+            continue
+        if pair in ('}}', ']]'):
+            depth = max(0, depth - 1)
+            current.append(pair)
+            i += 2
+            continue
+        c = s[i]
+        if c == sep and depth == 0:
             parts.append(''.join(current))
             current = []
         else:
             current.append(c)
+        i += 1
     parts.append(''.join(current))
     return parts
 
