@@ -39,9 +39,12 @@ WIKI_API="https://it.wikipedia.org/w/api.php"
 SAFE_STOP_THRESHOLD=300   # secondi: se Dati1 è stato modificato meno di 5 minuti fa, il bot sta scrivendo
 SAFE_STOP_POLL=30         # secondi: intervallo di controllo
 GENERIC_SAFE_STOP_MAX_WAIT=1200   # secondi: tetto di attesa per il controllo generico, oltre il quale si chiede conferma manuale
-# Cartella degli script su NFS: quella in cui si trova questo launcher
-# (percorso fisico, symlink risolti). I job eseguono gli script da qui.
-BOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# Cartella degli script su NFS: quella in cui si trova questo launcher.
+# I job eseguono gli script da qui. Si usa il percorso LOGICO (pwd senza
+# -P): sul bastion /data/project e' un symlink verso /mnt/nfs/..., ma nel
+# container del job e' montato solo /data/project, quindi il percorso
+# fisico non sarebbe raggiungibile.
+BOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ============================================================
 
 # Colori
@@ -88,6 +91,13 @@ check_script_exists() {
     if [ ! -f "${BOT_DIR}/${BOT_SCRIPT}" ]; then
         echo -e "${RED}ERRORE: script non trovato: ${BOT_DIR}/${BOT_SCRIPT}${NC}"
         echo -e "  Controlla il nome del file o esegui prima 'git pull' in ${BOT_DIR}."
+        exit 1
+    fi
+    # Su Toolforge il percorso deve stare sotto TOOL_DATA_DIR
+    # (/data/project/<tool>), l'unico visibile dal container del job.
+    if [ -n "$TOOL_DATA_DIR" ] && [[ "$BOT_DIR" != "$TOOL_DATA_DIR"/* ]]; then
+        echo -e "${RED}ERRORE: ${BOT_DIR} non e' sotto ${TOOL_DATA_DIR}: il container del job non lo vedrebbe.${NC}"
+        echo -e "  Lancia lo script da ${TOOL_DATA_DIR}/... (es. cd ~/botvocirecenti)."
         exit 1
     fi
     if [[ "$BOT_DIR" == *" "* ]]; then
